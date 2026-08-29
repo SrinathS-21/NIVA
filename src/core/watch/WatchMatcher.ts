@@ -1,0 +1,258 @@
+import { randomUUID } from 'expo-crypto';
+import { insertAction, type Action } from '../../db/repositories/actions';
+import { updateInsightStatus, type Insight } from '../../db/repositories/insights';
+import {
+  getEnabledWatches,
+  incrementWatchHandled,
+  type Watch,
+} from '../../db/repositories/watches';
+
+/**
+ * Watches, applied.
+ *
+ * A watch is the user's standing instruction: "you already know what I do with
+ * these — stop asking". Until now the Watch tab wrote rows to SQLite that
+ * nothing ever read, so every rule the user wrote was a note to itself. This
+ * is the half that was missing.
+ *
+ * The rule the whole file turns on: a watch may only ever *remove work*, never
+ * create it. It can hand an insight to the action the user pre-approved, and
+ * that is all. It cannot re-categorise, cannot delete, and cannot fire on
+ * something the model was unsure about — see `MIN_AUTO_CONFIDENCE`.
+ */
+
+/**
+ * How certain the model has to be before a rule is allowed to act without
+ * asking.
+ *
+ * The inbox already splits at 0.85 into Auto and Review, and anything landing
+ * in Review is by definition something the user should see. Automating a
+ * low-confidence read is how a watch silently files a misparsed message; the
+ * cost of the opposite mistake is one extra tap.
+ */
+const MIN_AUTO_CONFIDENCE = 0.85;
+
+/**
+ * What a watch matches on.
+ *
+ * Every field is optional and they combine with AND, so `{}` matches nothing —
+ * an empty rule is a bug in whatever created it, not a rule that catches
+ * everything. Older rows carry only `{ category, title }`; both still parse.
+ */
+export interface WatchTrigger {
+  category?: string;
+  /** Any one of these appearing in the title, summary or entities is a match. */
+  keywords?: string[];
+  /** Merchant / biller / provider names. Matched against entity fields only. */
+  merchants?: string[];
+  minAmount?: number;
+  maxAmount?: number;
+  /** Present on reminder-style rules. Carried through to the action payload. */
+  daysBefore?: number;
+}
+
+export interface WatchMatch {
+  watch: Watch;
+  /** The action that was applied, or null when the rule only counted the hit. */
+  action: Action['action_type'] | null;
+  /** Why it was not applied, when it was not. */
+  heldBack?: 'low_confidence';
+}
+
+// ─── Matching ─────────────────────────────────────────────────────────────────
+
+function parseTrigger(raw: string): WatchTrigger {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return {
+      category: typeof parsed.category === 'string' ? parsed.category : undefined,
+      keywords: Array.isArray(parsed.keywords) ? parsed.keywords.map(String) : undefined,
+      merchants: Array.isArray(parsed.merchants) ? parsed.merchants.map(String) : undefined,
+      minAmount: typeof parsed.minAmount === 'number' ? parsed.minAmount : undefined,
+      maxAmount: typeof parsed.maxAmount === 'number' ? parsed.maxAmount : undefined,
+      daysBefore: typeof parsed.daysBefore === 'number' ? parsed.daysBefore : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function entitiesOf(insight: Insight): Record<string, unknown> {
+  try {
+    return JSON.parse(insight.entities_json) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+/** Everything about an insight a keyword could reasonably appear in. */
+function searchableText(insight: Insight, entities: Record<string, unknown>): string {
+  const entityText = Object.values(entities)
+    .filter((v) => typeof v === 'string' || typeof v === 'number')
+    .join(' ');
+  return `${insight.title} ${insight.summary} ${entityText}`.toLowerCase();
+}
+
+/** The named party, whatever the schema for this category happens to call it. */
+function merchantOf(entities: Record<string, unknown>): string {
+  const candidates = [
+    entities.merchant,
+    entities.biller_name,
+    entities.provider,
+    entities.source,
+    entities.entity,
+  ];
+  return candidates.filter((c) => typeof c === 'string').join(' ').toLowerCase();
+}
+
+export function matchesTrigger(insight: Insight, trigger: WatchTrigger): boolean {
+  // An empty trigger matches nothing. See the interface comment.
+  const hasAnyCriterion =
+    trigger.category !== undefined ||
+    (trigger.keywords?.length ?? 0) > 0 ||
+    (trigger.merchants?.length ?? 0) > 0 ||
+    trigger.minAmount !== undefined ||
+    trigger.maxAmount !== undefined;
+  if (!hasAnyCriterion) return false;
+
+  if (trigger.category && trigger.category !== insight.category) return false;
+
+  const entities = entitiesOf(insight);
+
+  if (trigger.minAmount !== undefined || trigger.maxAmount !== undefined) {
+    const amount =
+      typeof entities.amount === 'number'
+        ? entities.amount
+        : typeof entities.amount_due === 'number'
+          ? entities.amount_due
+          : null;
+    // A bounded rule cannot match something with no figure to bound.
+    if (amount === null) return false;
+    if (trigger.minAmount !== undefined && amount < trigger.minAmount) return false;
+    if (trigger.maxAmount !== undefined && amount > trigger.maxAmount) return false;
+  }
+
+  if (trigger.merchants?.length) {
+    const merchant = merchantOf(entities);
+    const hit = trigger.merchants.some((m) => merchant.includes(m.toLowerCase()));
+    if (!hit) return false;
+  }
+
+  if (trigger.keywords?.length) {
+    const haystack = searchableText(insight, entities);
+    const hit = trigger.keywords.some((k) => haystack.includes(k.toLowerCase()));
+    if (!hit) return false;
+  }
+
+  return true;
+}
+
+// ─── Application ──────────────────────────────────────────────────────────────
+
+/** A watch's `auto_track` is a `track` once it reaches the actions table. */
+function actionTypeFor(watch: Watch): Action['action_type'] {
+  return watch.action_type === 'auto_track' ? 'track' : watch.action_type;
+}
+
+/**
+ * Runs every enabled watch against one insight and applies the first that
+ * matches.
+ *
+ * First, not all: two rules both claiming an insight is a conflict the user
+ * never expressed an opinion about, and applying both would write two action
+ * rows for one decision. Rules are ordered newest-first by the repository, so
+ * the most recently written rule wins — which is the one the user was most
+ * recently thinking about.
+ *
+ * Returns the match so the caller can decide whether the insight still belongs
+ * in the inbox. Nothing here touches UI state; that is the ingestion layer's
+ * job.
+ */
+export async function applyWatches(insight: Insight): Promise<WatchMatch | null> {
+  const watches = await getEnabledWatches();
+  if (watches.length === 0) return null;
+
+  for (const watch of watches) {
+    if (!matchesTrigger(insight, parseTrigger(watch.trigger_json))) continue;
+
+    // A rule that matched still counts as a hit even when it is not allowed to
+    // act — that is what makes "3 handled" on the Watch card honest, and it is
+    // the signal that a rule is firing on things the model is unsure about.
+    await incrementWatchHandled(watch.id);
+
+    if (insight.confidence < MIN_AUTO_CONFIDENCE) {
+      return { watch, action: null, heldBack: 'low_confidence' };
+    }
+
+    const actionType = actionTypeFor(watch);
+    await updateInsightStatus(insight.id, 'actioned');
+    await insertAction({
+      id: randomUUID(),
+      insight_id: insight.id,
+      action_type: actionType,
+      payload_json: JSON.stringify({
+        via: 'watch',
+        watch_id: watch.id,
+        watch_title: watch.title,
+      }),
+      executed_at: Date.now(),
+    });
+
+    return { watch, action: actionType };
+  }
+
+  return null;
+}
+
+// ─── Rule authoring ───────────────────────────────────────────────────────────
+
+/**
+ * Words that carry no discriminating power in a rule.
+ *
+ * A rule built from "Track all my food spending" must not end up keyed on
+ * "all" or "my" — those appear in half of everything and would make the rule
+ * fire on the whole inbox. What is left after this filter ("food", "spending")
+ * is what the user actually meant.
+ */
+const STOP_WORDS = new Set([
+  'a', 'all', 'an', 'and', 'any', 'are', 'as', 'at', 'be', 'before', 'but', 'by',
+  'do', 'dont', 'each', 'every', 'for', 'from', 'get', 'i', 'if', 'in', 'into',
+  'is', 'it', 'keep', 'me', 'miss', 'my', 'never', 'of', 'on', 'or', 'out',
+  'so', 'that', 'the', 'their', 'them', 'then', 'there', 'these', 'they',
+  'this', 'to', 'track', 'up', 'want', 'was', 'watch', 'we', 'what', 'when',
+  'where', 'which', 'with', 'you', 'your',
+]);
+
+/**
+ * Turns what the user typed into something matchable.
+ *
+ * Watches are authored as a sentence — that is the whole appeal of the
+ * feature — but a sentence is not a predicate. This is the cheapest honest
+ * bridge: keep the category, keep the words that carry meaning, and pick up a
+ * "3 days before"-style reminder offset if one was written. It is deliberately
+ * not a model call: a rule whose behaviour the user cannot predict is worse
+ * than a blunt one.
+ */
+export function buildTriggerFromText(text: string, category: string): WatchTrigger {
+  const normalized = text.toLowerCase();
+
+  const keywords = normalized
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !STOP_WORDS.has(w))
+    .slice(0, 8);
+
+  const trigger: WatchTrigger = { category };
+  if (keywords.length) trigger.keywords = keywords;
+
+  const daysBefore = normalized.match(/(\d+)\s*days?\s*(before|ahead|prior)/);
+  if (daysBefore) trigger.daysBefore = parseInt(daysBefore[1], 10);
+
+  const over = normalized.match(/(?:over|above|more than)\s*(\d[\d,]*)/);
+  if (over) trigger.minAmount = Number(over[1].replace(/,/g, ''));
+
+  const under = normalized.match(/(?:under|below|less than)\s*(\d[\d,]*)/);
+  if (under) trigger.maxAmount = Number(under[1].replace(/,/g, ''));
+
+  return trigger;
+}

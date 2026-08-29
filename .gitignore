@@ -39,3 +39,11 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Needle model files — large binary, tracked via Git LFS or downloaded separately
+# The bundled production model in assets/model/ IS committed (it's the app's core)
+# Local dev/test model files that should NOT be committed:
+model/*.gguf
+
+# EAS build artifacts
+.eas/
