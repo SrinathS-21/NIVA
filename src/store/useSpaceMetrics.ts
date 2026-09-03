@@ -1,7 +1,5 @@
 import { useEffect, useMemo } from 'react';
-import { computeSpaceMetrics, type SpaceMetrics, type SpaceMetricsMap } from '../core/metrics/spaceMetrics';
-import type { Insight } from '../db/repositories/insights';
-import { MOCK_INSIGHTS, USE_MOCK_DATA } from '../data/mockData';
+import type { SpaceMetrics, SpaceMetricsMap } from '../core/metrics/spaceMetrics';
 import { useSpaceMetricsStore } from './spaceMetricsStore';
 
 /**
@@ -9,9 +7,9 @@ import { useSpaceMetricsStore } from './spaceMetricsStore';
  *
  * Both the Spaces grid and a space's detail page need the same figures, and
  * the two must agree — a card saying "2 due this week" that opens onto a page
- * saying "3" undermines every other number in the app. Putting the load, the
- * mock fallback and the lookup behind a single hook is what makes that
- * structurally true rather than a thing to remember.
+ * saying "3" undermines every other number in the app. Putting the load and
+ * the lookup behind a single hook is what makes that structurally true rather
+ * than a thing to remember.
  *
  * Returns `null` for a space until the figures are known, so a caller can tell
  * "nothing in here" from "not read yet" and render accordingly.
@@ -25,17 +23,10 @@ export function useSpaceMetrics(): (key: string) => SpaceMetrics | null {
     load();
   }, [load]);
 
-  const resolved: SpaceMetricsMap | null = useMemo(() => {
-    const hasReal = Object.keys(metrics).length > 0;
-    if (hasReal) return metrics;
-
-    // Same rule the screens use for their lists: demo content stands in only
-    // while there is genuinely nothing to show. Once a single real insight
-    // exists, every figure comes from it.
-    if (USE_MOCK_DATA) return computeSpaceMetrics(MOCK_INSIGHTS as unknown as Insight[]);
-
-    return hasLoaded ? {} : null;
-  }, [metrics, hasLoaded]);
+  const resolved: SpaceMetricsMap | null = useMemo(
+    () => (hasLoaded ? metrics : null),
+    [metrics, hasLoaded],
+  );
 
   return useMemo(
     () => (key: string) => {

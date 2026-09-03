@@ -7,7 +7,18 @@ import {
   deleteWatch,
 } from '../db/repositories/watches';
 import { randomUUID } from 'expo-crypto';
-import { buildTriggerFromText } from '../core/watch/WatchMatcher';
+import { applyWatchToPending, type WatchTrigger } from '../core/watch/WatchMatcher';
+import { authorTrigger } from '../core/watch/WatchAuthoring';
+import { useInboxStore } from './inboxStore';
+
+/** What creating a rule did, so the screen can say so. */
+export interface WatchCreated {
+  watch: Watch;
+  /** Cards already waiting that the new rule handled on the spot. */
+  appliedToPending: number;
+  /** Whether the engine helped read the sentence. */
+  source: 'engine' | 'heuristic';
+}
 
 interface WatchState {
   watches: Watch[];
@@ -18,12 +29,23 @@ interface WatchState {
     category: string,
     actionType: Watch['action_type'],
     description?: string,
-  ) => Promise<void>;
+  ) => Promise<WatchCreated>;
+  /**
+   * A rule with its predicate already known — what a learned policy or a
+   * new space's "then…" creates. Bypasses the sentence parser.
+   */
+  addWatchWithTrigger: (
+    title: string,
+    category: string,
+    actionType: Watch['action_type'],
+    trigger: WatchTrigger,
+    description?: string,
+  ) => Promise<WatchCreated>;
   toggleWatchEnabled: (id: string, enabled: boolean) => Promise<void>;
   removeWatch: (id: string) => Promise<void>;
 }
 
-export const useWatchStore = create<WatchState>((set) => ({
+export const useWatchStore = create<WatchState>((set, get) => ({
   watches: [],
   isLoading: false,
 
@@ -48,19 +70,45 @@ export const useWatchStore = create<WatchState>((set) => ({
    */
   addWatch: async (title, category, actionType, description) => {
     const trimmed = title.trim();
+    // The engine reads the sentence when it is awake; the parser always does.
+    const authored = await authorTrigger(trimmed, category);
+    const created = await get().addWatchWithTrigger(trimmed, category, actionType, authored.trigger, description);
+    return { ...created, source: authored.source };
+  },
+
+  addWatchWithTrigger: async (title, category, actionType, trigger, description) => {
     const watch: Watch = {
       id: randomUUID(),
-      title: trimmed,
+      title: title.trim(),
       description: description ?? null,
       category,
       action_type: actionType,
-      trigger_json: JSON.stringify(buildTriggerFromText(trimmed, category)),
+      trigger_json: JSON.stringify(trigger),
       enabled: 1,
       created_at: Date.now(),
       handled_count: 0,
     };
     await insertWatch(watch);
     set((state) => ({ watches: [watch, ...state.watches] }));
+
+    // A new rule runs over what is already waiting. The person who wrote
+    // "ignore Myntra" with four Myntra cards on screen expects them gone.
+    let appliedToPending = 0;
+    try {
+      appliedToPending = await applyWatchToPending(watch);
+      if (appliedToPending > 0) {
+        await useInboxStore.getState().loadInbox();
+        set((state) => ({
+          watches: state.watches.map((w) =>
+            w.id === watch.id ? { ...w, handled_count: w.handled_count + appliedToPending } : w,
+          ),
+        }));
+      }
+    } catch (err) {
+      console.warn('[Watch] apply to pending failed:', err);
+    }
+
+    return { watch, appliedToPending, source: 'heuristic' };
   },
 
   toggleWatchEnabled: async (id, enabled) => {

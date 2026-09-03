@@ -5,6 +5,7 @@ const expoConfig = require("eslint-config-expo/flat");
 module.exports = defineConfig([
   expoConfig,
   {
-    ignores: ["dist/*"],
+    // `marketing/` is a separate Node project (Remotion) with its own toolchain.
+    ignores: ["dist/*", "marketing/**", "android/**"],
   }
 ]);

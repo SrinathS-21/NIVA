@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -6,7 +6,6 @@ import {
   TouchableOpacity,
   TextInput,
   StyleSheet,
-  Alert,
 } from 'react-native';
 import Animated, { FadeIn, FadeInDown } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -15,12 +14,13 @@ import { useWatchStore } from '../../src/store/watchStore';
 import { useCategoryStore } from '../../src/store/categoryStore';
 import { reportInteraction } from '../../src/store/activityStore';
 import { palette, accent, COLORS, FONT, RADIUS, SPACING } from '../../src/theme/tokens';
-import { MOCK_WATCHES, USE_MOCK_DATA } from '../../src/data/mockData';
 import { DURATION } from '../../src/theme/motion';
 import { ScreenHeader } from '../../src/components/ui/ScreenHeader';
-import { Plus, Eye, Pause, Play, Trash2, X, Tag } from 'lucide-react-native';
+import { previewTrigger } from '../../src/core/watch/WatchAuthoring';
+import { describeTrigger } from '../../src/core/watch/WatchMatcher';
+import { Plus, Eye, Pause, Play, Trash2, Check } from 'lucide-react-native';
 import type { Watch } from '../../src/db/repositories/watches';
-import { useTabReset } from '../../src/store/tabResetContext';
+import { useTabResetHandler } from '../../src/store/tabResetContext';
 
 type WatchActionType = Watch['action_type'];
 
@@ -29,6 +29,9 @@ const WATCH_ACTIONS: { key: WatchActionType; label: string }[] = [
   { key: 'track', label: 'Track it' },
   { key: 'remind', label: 'Remind me' },
   { key: 'calendar', label: 'Add to calendar' },
+  // The negative rule. "Stop showing me X" is the one that earns trust
+  // fastest, because noise is what people uninstall over.
+  { key: 'ignore', label: 'Ignore it' },
 ];
 
 export default function WatchScreen() {
@@ -40,11 +43,8 @@ export default function WatchScreen() {
   const removeWatch = useWatchStore((st) => st.removeWatch);
   const categories = useCategoryStore((st) => st.categories);
   const loadCategories = useCategoryStore((st) => st.loadCategories);
-  const addCategory = useCategoryStore((st) => st.addCategory);
-  const removeCategory = useCategoryStore((st) => st.removeCategory);
   const getAccent = useCategoryStore((st) => st.getAccent);
   const [showCreate, setShowCreate] = useState(false);
-  const [showManageCats, setShowManageCats] = useState(false);
   const [newTitle, setNewTitle] = useState('');
   const [selectedCat, setSelectedCat] = useState('finance');
   /**
@@ -53,68 +53,55 @@ export default function WatchScreen() {
    * ever express one of them.
    */
   const [selectedAction, setSelectedAction] = useState<WatchActionType>('track');
-  const [newCatLabel, setNewCatLabel] = useState('');
-  const { consumeReset } = useTabReset();
-
   // Reset open panels when re-tapping Watch in the dock.
-  useEffect(() => {
-    if (consumeReset('watch')) {
-      setShowCreate(false);
-      setShowManageCats(false);
-      setNewTitle('');
-      setNewCatLabel('');
-      setSelectedAction('track');
-    }
-  }, [consumeReset]);
+  useTabResetHandler('watch', () => {
+    setShowCreate(false);
+    setNewTitle('');
+    setSelectedAction('track');
+  });
   const P = palette(isDark);
   const A = accent(isDark);
 
   useEffect(() => { loadWatches(); }, [loadWatches]);
   useEffect(() => { loadCategories(); }, [loadCategories]);
 
-  const watches = useMemo(() => {
-    if (realWatches.length > 0) return realWatches;
-    return USE_MOCK_DATA ? (MOCK_WATCHES as any[]) : [];
-  }, [realWatches]);
+  const watches = realWatches;
 
   const activeWatches = watches.filter((w: any) => w.enabled === 1);
   const pausedWatches = watches.filter((w: any) => w.enabled === 0);
 
+  /**
+   * What the rule will match, in words, as it is typed.
+   *
+   * The deterministic parser runs on every keystroke; the engine only runs
+   * on Create. Showing the rule back before it is saved is the whole point:
+   * a rule the person cannot predict is worse than a blunt one.
+   */
+  const preview = newTitle.trim() ? describeTrigger(previewTrigger(newTitle, selectedCat)) : null;
+  const [created, setCreated] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+
   const handleCreate = async () => {
-    if (!newTitle.trim()) return;
-    await addWatch(newTitle.trim(), selectedCat, selectedAction);
-    setNewTitle('');
-    setSelectedAction('track');
-    setShowCreate(false);
+    if (!newTitle.trim() || creating) return;
+    setCreating(true);
+    try {
+      const result = await addWatch(newTitle.trim(), selectedCat, selectedAction);
+      setNewTitle('');
+      setSelectedAction('track');
+      setShowCreate(false);
+      const applied = result.appliedToPending;
+      setCreated(
+        applied > 0
+          ? `Watching — and handled ${applied} ${applied === 1 ? 'card' : 'cards'} already waiting.`
+          : result.source === 'engine'
+            ? 'Watching. Niva read the rule.'
+            : 'Watching.',
+      );
+      setTimeout(() => setCreated(null), 3500);
+    } finally {
+      setCreating(false);
+    }
   };
-
-  const handleAddCategory = async () => {
-    const label = newCatLabel.trim();
-    if (!label) return;
-    const newCat = await addCategory(label);
-    setSelectedCat(newCat.key);
-    setNewCatLabel('');
-  };
-
-  const handleRemoveCategory = (key: string, label: string) => {
-    Alert.alert(
-      `Remove "${label}"?`,
-      'This category will be removed from Spaces and Watches. Existing items will keep their category.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Remove',
-          style: 'destructive',
-          onPress: () => {
-            removeCategory(key);
-            if (selectedCat === key) setSelectedCat(categories[0]?.key ?? 'finance');
-          },
-        },
-      ],
-    );
-  };
-
-  const watchHasCategory = (key: string) => watches.some((w: any) => w.category === key);
 
   return (
     <SafeAreaView style={[styles.screen, { backgroundColor: P.canvas }]} edges={[]}>
@@ -123,94 +110,42 @@ export default function WatchScreen() {
         title="Watch"
         subtitle={
           activeWatches.length > 0
-            ? `Watching ${activeWatches.length} thing${activeWatches.length > 1 ? 's' : ''} for you`
-            : 'Set rules for what to track automatically'
+            ? `What Niva does for you · ${activeWatches.length} ${activeWatches.length > 1 ? 'rules' : 'rule'}`
+            : 'What Niva does for you, without asking'
         }
         titleAction={
-          <View style={styles.headerActions}>
-            <TouchableOpacity
-              style={[styles.headerBtn, { backgroundColor: P.surface, borderColor: P.stroke }]}
-              onPress={() => {
-                setShowManageCats(!showManageCats);
-              }}
-              activeOpacity={0.7}
-            >
-              <Tag size={14} color={showManageCats ? A.brand : P.inkMuted} strokeWidth={1.75} />
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.headerBtn, { backgroundColor: A.brand }]}
-              onPress={() => {
-                setShowCreate(!showCreate);
-              }}
-              activeOpacity={0.8}
-            >
-              <Plus size={16} color={COLORS.white} strokeWidth={2.5} />
-            </TouchableOpacity>
-          </View>
+          <TouchableOpacity
+            style={[styles.headerBtn, { backgroundColor: A.brand }]}
+            onPress={() => {
+              setShowCreate(!showCreate);
+            }}
+            activeOpacity={0.8}
+            accessibilityRole="button"
+            accessibilityLabel="New watch"
+          >
+            <Plus size={16} color={COLORS.white} strokeWidth={2.5} />
+          </TouchableOpacity>
         }
       />
 
       <ScrollView contentContainerStyle={{ paddingBottom: 96 }} onScroll={reportInteraction} scrollEventThrottle={50}>
-        {/* ── Category Manager ──────────────────────────────────── */}
-        {showManageCats && (
-          <Animated.View entering={FadeInDown.duration(DURATION.normal)} style={styles.sectionWrap}>
-            <View style={[styles.managerCard, { backgroundColor: P.surface, borderColor: P.stroke }]}>
-              <Text style={[styles.managerTitle, { color: P.ink }]}>Categories</Text>
-              <Text style={[styles.managerHint, { color: P.inkMuted }]}>
-                Add or remove categories. New ones appear in Spaces and Watches.
-              </Text>
-
-              {/* Existing categories */}
-              <View style={styles.catList}>
-                {categories.map((cat) => {
-                  const hasWatches = watchHasCategory(cat.key);
-                  const canRemove = !cat.isBuiltIn;
-                  return (
-                    <View key={cat.key} style={[styles.catRow, { borderBottomColor: P.stroke }]}>
-                      <View style={[styles.catDot, { backgroundColor: getAccent(cat.key, isDark).color }]} />
-                      <Text style={[styles.catLabel, { color: P.ink }]}>{cat.label}</Text>
-                      {cat.isBuiltIn && (
-                        <Text style={[styles.catBadge, { color: P.inkDim }]}>Built-in</Text>
-                      )}
-                      {hasWatches && !cat.isBuiltIn && (
-                        <Text style={[styles.catBadge, { color: P.inkDim }]}>{watches.filter((w: any) => w.category === cat.key).length} watch{watches.filter((w: any) => w.category === cat.key).length !== 1 ? 'es' : ''}</Text>
-                      )}
-                      {canRemove && (
-                        <TouchableOpacity
-                          onPress={() => handleRemoveCategory(cat.key, cat.label)}
-                          style={styles.removeCatBtn}
-                          activeOpacity={0.6}
-                        >
-                          <X size={13} color={A.danger} strokeWidth={2} />
-                        </TouchableOpacity>
-                      )}
-                    </View>
-                  );
-                })}
-              </View>
-
-              {/* Add new category */}
-              <View style={styles.addCatRow}>
-                <TextInput
-                  style={[styles.addCatInput, { backgroundColor: P.canvas, borderColor: P.stroke, color: P.ink }]}
-                  placeholder="New category name..."
-                  placeholderTextColor={P.inkDim}
-                  value={newCatLabel}
-                  onChangeText={setNewCatLabel}
-                  onSubmitEditing={handleAddCategory}
-                />
-                <TouchableOpacity
-                  style={[styles.addCatBtn, { backgroundColor: newCatLabel.trim() ? A.brand : P.canvasSubtle }]}
-                  onPress={handleAddCategory}
-                  disabled={!newCatLabel.trim()}
-                  activeOpacity={0.7}
-                >
-                  <Plus size={14} color={newCatLabel.trim() ? COLORS.white : P.inkDim} strokeWidth={2.5} />
-                </TouchableOpacity>
-              </View>
+        {created && (
+          <Animated.View entering={FadeIn.duration(DURATION.normal)} style={styles.sectionWrap}>
+            <View style={[styles.createdBanner, { backgroundColor: A.actionSoft, borderColor: A.action }]}>
+              <Check size={14} color={A.action} strokeWidth={2.5} />
+              <Text style={[styles.createdText, { color: A.action }]}>{created}</Text>
             </View>
           </Animated.View>
         )}
+
+        {/* Spaces are made in Spaces.
+
+            There used to be a category manager here: a second place to
+            create a space, which made one with no routing rule, no colour
+            and no icon — a label the pipeline could never reach. Two doors
+            to one idea is what made "space" and "watch" feel like the same
+            thing. A watch is scoped to a space; the space itself belongs to
+            the Spaces tab, where its rule lives. */}
 
         {/* ── Create Sheet ─────────────────────────────────────── */}
         {showCreate && (
@@ -228,6 +163,11 @@ export default function WatchScreen() {
                 onChangeText={setNewTitle}
                 multiline
               />
+              {preview && (
+                <Text style={[styles.previewText, { color: P.inkMuted }]} numberOfLines={2}>
+                  Will match: <Text style={{ color: P.ink, fontFamily: FONT.semibold }}>{preview}</Text>
+                </Text>
+              )}
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: SPACING.base }}>
                 <View style={{ flexDirection: 'row', gap: 6 }}>
                   {categories.map((cat) => {
@@ -279,24 +219,35 @@ export default function WatchScreen() {
               </View>
 
               <TouchableOpacity
-                style={[styles.createBtn, { backgroundColor: A.brand, opacity: newTitle.trim() ? 1 : 0.4 }]}
-                onPress={handleCreate}
-                disabled={!newTitle.trim()}
+                style={[styles.createBtn, { backgroundColor: A.brand, opacity: newTitle.trim() && !creating ? 1 : 0.4 }]}
+                onPress={() => { handleCreate().catch(console.error); }}
+                disabled={!newTitle.trim() || creating}
                 activeOpacity={0.8}
               >
-                <Text style={styles.createBtnText}>Create Watch</Text>
+                <Text style={styles.createBtnText}>{creating ? 'Reading the rule…' : 'Create Watch'}</Text>
               </TouchableOpacity>
             </View>
           </Animated.View>
         )}
 
-        {/* ── Active Watches ──────────────────────────────────── */}
+        {/* ── Active Watches, grouped by the space they belong to ─────────
+            A watch is scoped to a space; showing them under their space is
+            what makes the two ideas read as related rather than as two
+            unrelated lists with the same category picker. */}
         {activeWatches.length > 0 && (
           <Animated.View entering={FadeIn.delay(100).duration(DURATION.normal)} style={styles.sectionWrap}>
-            <Text style={[styles.sectionLabel, { color: P.inkDim }]}>Active</Text>
-            {activeWatches.map((watch: any, idx: number) => {
+            {[
+              ...categories.map((c) => ({ key: c.key, label: c.label, items: activeWatches.filter((w: any) => w.category === c.key) })),
+              { key: '__other', label: 'Other', items: activeWatches.filter((w: any) => !categories.some((c) => c.key === w.category)) },
+            ]
+              .filter((g) => g.items.length > 0)
+              .map((group) => (
+                <View key={group.key} style={styles.groupWrap}>
+                  <Text style={[styles.sectionLabel, { color: P.inkDim }]}>{group.label}</Text>
+            {group.items.map((watch: any, idx: number) => {
               const cat = categories.find((c) => c.key === watch.category);
               const accentColor = cat ? getAccent(cat.key, isDark).color : A.brand;
+              const suggested = watch.description === 'Suggested by Niva';
               return (
                 <Animated.View key={watch.id} entering={FadeIn.delay(idx * 40).duration(200)}>
                   <View style={[styles.watchCard, { backgroundColor: P.surface, borderColor: P.stroke }]}>
@@ -304,9 +255,8 @@ export default function WatchScreen() {
                     <View style={{ flex: 1 }}>
                       <Text style={[styles.watchTitle, { color: P.ink }]} numberOfLines={1}>{watch.title}</Text>
                       <Text style={[styles.watchMeta, { color: P.inkMuted }]}>
-                        {cat?.label ?? watch.category} ·{' '}
                         {WATCH_ACTIONS.find((a) => a.key === watch.action_type)?.label ?? 'Track it'} ·{' '}
-                        {watch.handled_count} handled
+                        {watch.handled_count} handled{suggested ? ' · suggested by Niva' : ''}
                       </Text>
                     </View>
                     <TouchableOpacity
@@ -329,6 +279,8 @@ export default function WatchScreen() {
                 </Animated.View>
               );
             })}
+                </View>
+              ))}
           </Animated.View>
         )}
 
@@ -368,9 +320,11 @@ export default function WatchScreen() {
             <View style={[styles.emptyIcon, { backgroundColor: A.brandSoft }]}>
               <Eye size={22} color={A.brand} strokeWidth={2} />
             </View>
-            <Text style={[styles.emptyTitle, { color: P.ink }]}>No active watches</Text>
+            <Text style={[styles.emptyTitle, { color: P.ink }]}>Nothing on autopilot yet</Text>
             <Text style={[styles.emptyBody, { color: P.inkMuted }]}>
-              Tell Niva what to watch for.{'\n'}It handles repetitive actions automatically.
+              A watch is a standing instruction — “track all my food spending”,{'\n'}
+              “remind me about bills 3 days before”, “ignore Myntra”.{'\n'}
+              Niva will also suggest one after you repeat yourself.
             </Text>
             <TouchableOpacity
               style={[styles.emptyBtn, { backgroundColor: A.brand }]}
@@ -389,10 +343,6 @@ export default function WatchScreen() {
 const styles = StyleSheet.create({
   screen: { flex: 1 },
 
-  headerActions: {
-    flexDirection: 'row',
-    gap: 8,
-  },
   headerBtn: {
     width: 32,
     height: 32,
@@ -403,80 +353,12 @@ const styles = StyleSheet.create({
   },
 
   sectionWrap: { paddingHorizontal: SPACING.base, marginTop: SPACING.base },
+  groupWrap: { marginBottom: SPACING.sm },
   sectionLabel: {
     fontFamily: FONT.semibold,
     fontSize: 11,
     lineHeight: 14,
     marginBottom: 6,
-  },
-
-  // ── Category Manager ────────────────────────────────────────────────────
-  managerCard: {
-    padding: SPACING.base,
-    borderRadius: RADIUS.lg,
-    borderWidth: StyleSheet.hairlineWidth,
-  },
-  managerTitle: {
-    fontFamily: FONT.semibold,
-    fontSize: 15,
-    lineHeight: 20,
-    marginBottom: 2,
-  },
-  managerHint: {
-    fontFamily: FONT.regular,
-    fontSize: 12,
-    lineHeight: 16,
-    marginBottom: SPACING.sm,
-  },
-  catList: {
-    marginBottom: SPACING.sm,
-  },
-  catRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: SPACING.sm,
-    paddingVertical: 8,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-  },
-  catDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-  },
-  catLabel: {
-    flex: 1,
-    fontFamily: FONT.medium,
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  catBadge: {
-    fontFamily: FONT.regular,
-    fontSize: 10,
-    lineHeight: 13,
-  },
-  removeCatBtn: {
-    padding: 6,
-  },
-  addCatRow: {
-    flexDirection: 'row',
-    gap: 6,
-  },
-  addCatInput: {
-    flex: 1,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: RADIUS.md,
-    paddingHorizontal: SPACING.md,
-    paddingVertical: 8,
-    fontFamily: FONT.regular,
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  addCatBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: RADIUS.md,
-    alignItems: 'center',
-    justifyContent: 'center',
   },
 
   // ── Create Watch ────────────────────────────────────────────────────────
@@ -513,6 +395,28 @@ const styles = StyleSheet.create({
     lineHeight: 14,
     letterSpacing: 0.5,
     marginBottom: SPACING.xs,
+  },
+  previewText: {
+    fontFamily: FONT.regular,
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: -SPACING.xs,
+    marginBottom: SPACING.sm,
+  },
+  createdBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.sm,
+    paddingHorizontal: SPACING.md,
+    paddingVertical: 10,
+    borderRadius: RADIUS.md,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  createdText: {
+    fontFamily: FONT.semibold,
+    fontSize: 12,
+    lineHeight: 16,
+    flex: 1,
   },
   actionRow: {
     flexDirection: 'row',

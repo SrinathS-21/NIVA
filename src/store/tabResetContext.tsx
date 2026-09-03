@@ -1,54 +1,79 @@
-import React, { createContext, useContext, useMemo, useRef, useState, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useCallback } from 'react';
+
+/**
+ * "Re-tap the tab you are on, and it goes back to its root state."
+ *
+ * ── Listeners, not counters ─────────────────────────────────────────────────
+ * This used to be a `resetCounts` state object on the provider. A dock tap
+ * bumped a counter, the provider re-rendered, every mounted tab re-rendered
+ * with it, and each tab ran an effect that compared the counter to the last
+ * one it had seen and — if it had moved — set its own state. Five screens
+ * re-rendering so that one of them could notice a number changed, and a
+ * `setState` inside an effect on the critical path of every tap.
+ *
+ * A listener map does the same job with none of that. The dock calls
+ * `requestReset('home')`, the inbox's handler runs, the inbox alone updates.
+ * Nothing in React re-renders on the way there.
+ */
+type Handler = () => void;
 
 interface TabResetCtx {
-  /** Increment to signal a reset to a specific tab. */
-  resetCounts: Record<string, number>;
   /** Call from the dock when re-tapping the active tab. */
   requestReset: (tabKey: string) => void;
-  /** Read inside a tab screen to detect a reset signal (then reset your state). */
-  consumeReset: (tabKey: string) => boolean;
+  /** Register a tab's reset behaviour. Returns the unsubscribe. */
+  subscribe: (tabKey: string, handler: Handler) => () => void;
 }
 
 const Ctx = createContext<TabResetCtx>({
-  resetCounts: {},
   requestReset: () => {},
-  consumeReset: () => false,
+  subscribe: () => () => {},
 });
 
 export function TabResetProvider({ children }: { children: React.ReactNode }) {
-  const [resetCounts, setResetCounts] = useState<Record<string, number>>({});
+  const handlers = useRef(new Map<string, Set<Handler>>());
 
-  const requestReset = useCallback((tabKey: string) => {
-    setResetCounts((prev) => ({ ...prev, [tabKey]: (prev[tabKey] ?? 0) + 1 }));
+  const subscribe = useCallback((tabKey: string, handler: Handler) => {
+    const map = handlers.current;
+    if (!map.has(tabKey)) map.set(tabKey, new Set());
+    map.get(tabKey)!.add(handler);
+    return () => {
+      map.get(tabKey)?.delete(handler);
+    };
   }, []);
 
-  // Track which reset counts have been consumed so each screen only reacts once.
-  const consumedRef = useRef<Record<string, number>>({});
-
-  const consumeReset = useCallback(
-    (tabKey: string) => {
-      const current = resetCounts[tabKey] ?? 0;
-      const last = consumedRef.current[tabKey] ?? 0;
-      if (current > last) {
-        consumedRef.current[tabKey] = current;
-        return true;
+  const requestReset = useCallback((tabKey: string) => {
+    handlers.current.get(tabKey)?.forEach((fn) => {
+      try {
+        fn();
+      } catch (err) {
+        console.warn('[TabReset] handler threw:', err);
       }
-      return false;
-    },
-    [resetCounts],
-  );
+    });
+  }, []);
 
-  // A fresh object literal here would be a new context value on every render of
-  // the tab layout, which re-renders all five mounted tab screens — including
-  // on every dock tap, since the layout re-renders to move the highlight.
-  const value = useMemo(
-    () => ({ resetCounts, requestReset, consumeReset }),
-    [resetCounts, requestReset, consumeReset],
-  );
+  const value = useMemo(() => ({ requestReset, subscribe }), [requestReset, subscribe]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 
 export function useTabReset() {
   return useContext(Ctx);
+}
+
+/**
+ * Give a tab its reset behaviour.
+ *
+ * The handler is held in a ref so the subscription is made once per mount
+ * and the latest closure still runs — a screen may re-render fifty times
+ * between two dock taps and must not re-subscribe on each of them.
+ */
+export function useTabResetHandler(tabKey: string, handler: Handler): void {
+  const { subscribe } = useTabReset();
+  const latest = useRef(handler);
+
+  useEffect(() => {
+    latest.current = handler;
+  });
+
+  useEffect(() => subscribe(tabKey, () => latest.current()), [subscribe, tabKey]);
 }

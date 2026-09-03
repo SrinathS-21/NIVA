@@ -1,15 +1,16 @@
-import React, { useCallback, useEffect, useState, useMemo } from 'react';
+import React, { useCallback, useState, useMemo } from 'react';
 import { View, Text, FlatList, RefreshControl, StyleSheet } from 'react-native';
 import Animated, { FadeIn } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useFocusEffect } from 'expo-router';
 import { getActivityInsights, type Insight } from '../../src/db/repositories/insights';
 import { getLatestActionByInsight, type Action } from '../../src/db/repositories/actions';
 import { palette, accent, FONT, SPACING } from '../../src/theme/tokens';
 import { useThemeStore } from '../../src/store/themeStore';
 import { reportInteraction } from '../../src/store/activityStore';
 import { useCategoryStore } from '../../src/store/categoryStore';
-import { MOCK_ACTIVITY, USE_MOCK_DATA } from '../../src/data/mockData';
 import { ScreenHeader } from '../../src/components/ui/ScreenHeader';
+import { MiniBars } from '../../src/components/charts/MiniBars';
 import { DURATION } from '../../src/theme/motion';
 
 /**
@@ -25,8 +26,10 @@ import { DURATION } from '../../src/theme/motion';
 const ACTION_LABELS: Record<Action['action_type'], string> = {
   track: 'You tracked it',
   remind: 'Reminder set',
-  calendar: 'Added to calendar',
+  calendar: 'Opened in calendar',
   ignore: 'Ignored',
+  paid: 'Paid — matched to a payment',
+  share: 'Sent to another app',
 };
 
 interface TimelineRow {
@@ -39,20 +42,34 @@ function outcomeFor(row: TimelineRow): { label: string; automatic: boolean } {
 
   if (action) {
     let watchTitle: string | null = null;
+    let byNiva = false;
     try {
       const payload = action.payload_json ? JSON.parse(action.payload_json) : null;
       if (payload?.via === 'watch') watchTitle = String(payload.watch_title ?? 'a watch');
+      if (payload?.via === 'niva') byNiva = true;
     } catch {
       // Unreadable payload just means no attribution.
     }
-    return watchTitle
-      ? { label: `Handled by "${watchTitle}"`, automatic: true }
-      : { label: ACTION_LABELS[action.action_type], automatic: false };
+    if (watchTitle) return { label: `Handled by "${watchTitle}"`, automatic: true };
+    if (byNiva) return { label: ACTION_LABELS[action.action_type], automatic: true };
+    return { label: ACTION_LABELS[action.action_type], automatic: false };
   }
 
   if (insight.status === 'dismissed') return { label: 'Ignored', automatic: false };
   if (insight.status === 'actioned') return { label: 'Handled', automatic: false };
   return { label: 'Waiting for you', automatic: false };
+}
+
+/**
+ * One query each, joined in memory. The alternative — an action lookup per
+ * row inside the renderer — is 100 round trips on every re-render.
+ */
+async function fetchRows(): Promise<TimelineRow[]> {
+  const [insights, actions] = await Promise.all([
+    getActivityInsights(100),
+    getLatestActionByInsight(200),
+  ]);
+  return insights.map((insight) => ({ insight, action: actions[insight.id] ?? null }));
 }
 
 function dayLabel(ts: number): string {
@@ -70,23 +87,49 @@ function dayLabel(ts: number): string {
 
 export default function ActivityScreen() {
   const [rows, setRows] = useState<TimelineRow[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  // When `rows` was read. The week line is computed relative to this rather
+  // than to the clock, because render is not allowed to ask what time it is.
+  const [loadedAt, setLoadedAt] = useState(0);
+  // True from the first render: the mount effect reads straight away, and
+  // seeding the flag here is what keeps that effect free of a synchronous
+  // `setState` — the pull-to-refresh path sets it from a gesture instead.
+  const [isLoading, setIsLoading] = useState(true);
   const isDark = useThemeStore((st) => st.isDark);
   const getAccent = useCategoryStore((st) => st.getAccent);
   const loadCategories = useCategoryStore((st) => st.loadCategories);
   const P = palette(isDark);
   const A = accent(isDark);
 
-  const load = useCallback(async () => {
+  /**
+   * Reloaded on every focus, not only on mount: the inbox and the watches
+   * write to the same tables, and a timeline that only reads once per launch
+   * shows yesterday's answer to today's question.
+   */
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+      loadCategories();
+      fetchRows()
+        .then((next) => {
+          if (cancelled) return;
+          setRows(next);
+          setLoadedAt(Date.now());
+        })
+        .catch((err) => console.error('[Activity] Failed to load:', err))
+        .finally(() => {
+          if (!cancelled) setIsLoading(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [loadCategories]),
+  );
+
+  const refresh = useCallback(async () => {
     setIsLoading(true);
     try {
-      // One query each, joined in memory. The alternative — an action lookup
-      // per row inside the renderer — is 100 round trips on every re-render.
-      const [insights, actions] = await Promise.all([
-        getActivityInsights(100),
-        getLatestActionByInsight(200),
-      ]);
-      setRows(insights.map((insight) => ({ insight, action: actions[insight.id] ?? null })));
+      setRows(await fetchRows());
+      setLoadedAt(Date.now());
     } catch (err) {
       console.error('[Activity] Failed to load:', err);
     } finally {
@@ -94,12 +137,57 @@ export default function ActivityScreen() {
     }
   }, []);
 
-  useEffect(() => {
-    loadCategories();
-    load();
-  }, [loadCategories, load]);
-
   const hasRealData = rows.length > 0;
+
+  /**
+   * The week in one line.
+   *
+   * The Hooked loop's last step is investment: proof that the thing is
+   * working for you, so that opening it tomorrow feels earned rather than
+   * dutiful. "14 noticed · 9 handled · 3 by watches" is that proof, and the
+   * watches figure in particular is the app quietly doing work on its own.
+   */
+  const weekLine = useMemo(() => {
+    if (!hasRealData) return 'Everything Niva captured';
+    const since = loadedAt - 7 * 24 * 60 * 60 * 1000;
+    let noticed = 0;
+    let handled = 0;
+    let byWatch = 0;
+    for (const row of rows) {
+      if (row.insight.created_at < since) continue;
+      noticed += 1;
+      if (row.insight.status === 'actioned') handled += 1;
+      if (outcomeFor(row).automatic) byWatch += 1;
+    }
+    const parts = [`${noticed} noticed`, `${handled} handled`];
+    if (byWatch > 0) parts.push(`${byWatch} by watches`);
+    return `This week · ${parts.join(' · ')}`;
+  }, [rows, hasRealData, loadedAt]);
+
+  /**
+   * Seven days of "noticed", as a strip. Change over time is the job, one
+   * measure, one hue, today at full strength — the same method the month
+   * screen uses, at the size a header can afford.
+   */
+  const week = useMemo(() => {
+    if (!hasRealData || !loadedAt) return [];
+    const points: { key: string; label: string; value: number }[] = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(loadedAt - i * 24 * 60 * 60 * 1000);
+      points.push({
+        key: `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`,
+        label: d.toLocaleDateString('en-IN', { weekday: 'short' }).slice(0, 2),
+        value: 0,
+      });
+    }
+    const index = new Map(points.map((p) => [p.key, p]));
+    for (const row of rows) {
+      const d = new Date(row.insight.created_at);
+      const p = index.get(`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
+      if (p) p.value += 1;
+    }
+    return points.map((p) => ({ ...p, valueText: `${p.value}` }));
+  }, [rows, hasRealData, loadedAt]);
 
   const groupedItems = useMemo(() => {
     if (!hasRealData) return null;
@@ -126,7 +214,7 @@ export default function ActivityScreen() {
   const refreshControl = (
     <RefreshControl
       refreshing={isLoading}
-      onRefresh={load}
+      onRefresh={refresh}
       tintColor={A.brand}
       colors={[A.brand]}
     />
@@ -137,7 +225,7 @@ export default function ActivityScreen() {
       {/* ── Header (shared) ────────────────────────────────── */}
       <ScreenHeader
         title="Activity"
-        subtitle="Everything Niva captured"
+        subtitle={weekLine}
       />
 
       {hasRealData && groupedItems ? (
@@ -148,6 +236,19 @@ export default function ActivityScreen() {
           onScroll={reportInteraction}
           scrollEventThrottle={50}
           refreshControl={refreshControl}
+          ListHeaderComponent={
+            week.length > 0 ? (
+              <View style={styles.weekWrap}>
+                <MiniBars
+                  isDark={isDark}
+                  tint={A.brand}
+                  points={week}
+                  height={36}
+                  accessibilityLabel={`Messages noticed per day this week: ${week.map((p) => `${p.label} ${p.value}`).join(', ')}`}
+                />
+              </View>
+            ) : null
+          }
           renderItem={({ item: group }) => (
             <View>
               <Animated.View entering={FadeIn.duration(DURATION.slow)}>
@@ -192,11 +293,9 @@ export default function ActivityScreen() {
         />
       ) : (
         <FlatList
-          data={USE_MOCK_DATA ? MOCK_ACTIVITY : []}
-          keyExtractor={(i) => i.id}
-          contentContainerStyle={
-            USE_MOCK_DATA ? { paddingBottom: 96 } : { flexGrow: 1, justifyContent: 'center' }
-          }
+          data={[] as TimelineRow[]}
+          keyExtractor={(i) => i.insight.id}
+          contentContainerStyle={{ flexGrow: 1, justifyContent: 'center' }}
           onScroll={reportInteraction}
           scrollEventThrottle={50}
           refreshControl={refreshControl}
@@ -205,29 +304,15 @@ export default function ActivityScreen() {
              failed to load. */
           ListEmptyComponent={
             <View style={styles.emptyWrap}>
-              <Text style={[styles.emptyTitle, { color: P.ink }]}>Nothing yet</Text>
+              <Text style={[styles.emptyTitle, { color: P.ink }]}>
+                {isLoading ? 'Loading…' : 'Nothing yet'}
+              </Text>
               <Text style={[styles.emptyBody, { color: P.inkMuted }]}>
                 Everything Niva notices, and what you did about it, shows up here.
               </Text>
             </View>
           }
-          renderItem={({ item }) => (
-            <Animated.View entering={FadeIn.duration(DURATION.slow)}>
-              <View style={[styles.row, { borderBottomColor: P.stroke }]}>
-                <View style={styles.rowTime}>
-                  <Text style={[styles.timeText, { color: P.inkDim }]}>{item.time}</Text>
-                </View>
-                <View style={[styles.dot, { backgroundColor: A.success }]} />
-                <View style={styles.rowContent}>
-                  <Text style={[styles.rowTitle, { color: P.ink }]} numberOfLines={1}>{item.action}</Text>
-                  <View style={styles.rowMeta}>
-                    <Text style={[styles.statusLabel, { color: A.success }]}>{item.result}</Text>
-                    <Text style={[styles.categoryLabel, { color: P.inkDim }]}>{item.date}</Text>
-                  </View>
-                </View>
-              </View>
-            </Animated.View>
-          )}
+          renderItem={() => null}
         />
       )}
     </SafeAreaView>
@@ -236,6 +321,12 @@ export default function ActivityScreen() {
 
 const styles = StyleSheet.create({
   screen: { flex: 1 },
+
+  // ── Week strip ──────────────────────────────────────────────────────────
+  weekWrap: {
+    paddingHorizontal: SPACING.base,
+    paddingTop: SPACING.xs,
+  },
 
   // ── Timeline ────────────────────────────────────────────────────────────
   groupLabel: {

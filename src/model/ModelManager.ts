@@ -79,11 +79,27 @@ export function getLoadedModel(id: NivaModelId): CactusLM | null {
 /**
  * Drops a version from memory. The weights stay on disk, so switching back
  * to it later does not re-download.
+ *
+ * `destroy()` is the part that actually frees anything. This used to delete
+ * the map entry and stop — which released the JavaScript wrapper and left
+ * the native runtime holding two hundred megabytes of weights it would never
+ * be asked about again. Switching Niva 2 → Niva 2 Pro on a mid-range phone
+ * was therefore one engine switch away from being killed for memory.
  */
-export function releaseModel(id: NivaModelId): void {
+export async function releaseModel(id: NivaModelId): Promise<void> {
+  const lm = instances.get(id);
   instances.delete(id);
+  if (!lm) return;
+  try {
+    await lm.destroy();
+  } catch (err) {
+    // A destroy that throws has still dropped our reference; the runtime
+    // reclaims what it can. Not worth failing a model switch over.
+    console.warn('[ModelManager] destroy failed:', err);
+  }
 }
 
-export function releaseAll(): void {
-  instances.clear();
+export async function releaseAll(): Promise<void> {
+  const ids = [...instances.keys()];
+  await Promise.all(ids.map((id) => releaseModel(id)));
 }

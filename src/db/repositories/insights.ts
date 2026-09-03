@@ -3,7 +3,12 @@ import { getDb } from '../schema';
 export interface Insight {
   id: string;
   signal_id: string | null;
-  category: 'finance' | 'bill' | 'delivery' | 'travel' | 'task';
+  /**
+   * A space key. One of the five built-ins from the model, or a user-made
+   * space's key once a routing rule has claimed it — which is why this is a
+   * string and not the five-way union it used to be.
+   */
+  category: string;
   title: string;
   summary: string;
   entities_json: string;
@@ -116,6 +121,29 @@ export async function getInsightsForMetrics(limit = 1000): Promise<Insight[]> {
   return db.getAllAsync<Insight>(
     `SELECT * FROM insights ORDER BY created_at DESC LIMIT ?`,
     [limit],
+  );
+}
+
+/**
+ * Bills a payment could settle: still waiting, or tracked but not yet paid.
+ *
+ * Tracked bills are included on purpose — "track" means "I know about it",
+ * not "I paid it" — and the reconciler is what turns the first into the
+ * second. Dismissed bills are the user saying "not mine"; they stay out.
+ */
+export async function getSettleableBills(sinceMs: number): Promise<Insight[]> {
+  const db = await getDb();
+  return db.getAllAsync<Insight>(
+    `SELECT i.* FROM insights i
+      WHERE i.category = 'bill'
+        AND i.status IN ('inbox', 'actioned')
+        AND i.created_at >= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM actions a WHERE a.insight_id = i.id AND a.action_type = 'paid'
+        )
+      ORDER BY i.created_at DESC
+      LIMIT 100`,
+    [sinceMs],
   );
 }
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useCallback, useState, useMemo } from 'react';
+import React, { useEffect, useCallback, useState, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -17,7 +17,7 @@ import Animated, {
   interpolateColor,
 } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Check, SlidersHorizontal, KeyRound, X } from 'lucide-react-native';
+import { Check, SlidersHorizontal, KeyRound, X, Copy, Sparkles, Wifi } from 'lucide-react-native';
 import { useInboxStore } from '../../src/store/inboxStore';
 import { useModelStore } from '../../src/store/modelStore';
 import { useThemeStore } from '../../src/store/themeStore';
@@ -26,13 +26,29 @@ import { InsightCard } from '../../src/components/ui/InsightCard';
 import { SheetModal } from '../../src/components/ui/SheetModal';
 import { SignalSourcesCard } from '../../src/components/settings/SignalSourcesCard';
 import { DayNavigator, WeekStrip } from '../../src/components/ui/DayNavigator';
+import { TodayBriefing } from '../../src/components/inbox/TodayBriefing';
+import { FirstInsightMoment } from '../../src/components/inbox/FirstInsightMoment';
+import { SuggestionCard } from '../../src/components/inbox/SuggestionCard';
 import { palette, accent, withAlpha, FONT, TYPE, RADIUS, SPACING } from '../../src/theme/tokens';
 import { useCategoryStore } from '../../src/store/categoryStore';
 import { useCaptureStore } from '../../src/store/captureStore';
-import { MOCK_INSIGHTS, USE_MOCK_DATA } from '../../src/data/mockData';
+import { runSampleSignals, SAMPLE_SIGNALS } from '../../src/data/sampleSignals';
+import { getFirstInsightSeen, setFirstInsightSeen } from '../../src/db/repositories/settings';
+import { CONFIDENCE_GATE } from '../../src/core/needle/NeedleEngine';
 import { DURATION, SPRING, SPRING_SNAP } from '../../src/theme/motion';
 import type { Insight } from '../../src/db/repositories/insights';
-import { useTabReset } from '../../src/store/tabResetContext';
+import { useTabResetHandler } from '../../src/store/tabResetContext';
+
+// Lazily required so the screen loads in Expo Go / a dev client built before
+// expo-clipboard was added. Every use site checks for null first.
+const Clipboard: typeof import('expo-clipboard') | null = (() => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return require('expo-clipboard');
+  } catch {
+    return null;
+  }
+})();
 
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
@@ -105,10 +121,10 @@ function FilterPill({
     <AnimatedPressable
       onPress={onPress}
       onPressIn={() => {
-        press.value = withTiming(0.95, { duration: DURATION.press });
+        press.set(withTiming(0.95, { duration: DURATION.press }));
       }}
       onPressOut={() => {
-        press.value = withSpring(1, SPRING);
+        press.set(withSpring(1, SPRING));
       }}
       style={[styles.filterPill, pillStyle]}
     >
@@ -147,6 +163,7 @@ function FilterPill({
 interface InboxHeaderProps {
   isDark: boolean;
   selectedDate: Date;
+  isToday: boolean;
   onSelectDate: (d: Date) => void;
   attentionCount: number;
   autoCount: number;
@@ -155,11 +172,17 @@ interface InboxHeaderProps {
   onFilterChange: (f: 'all' | 'auto' | 'review') => void;
   selectedSpace: string | null;
   onOpenSpaceSheet: () => void;
+  /** Changes identity whenever the inbox changes, so the briefing re-reads. */
+  briefingVersion: unknown;
+  showFirstMoment: boolean;
+  onDismissFirstMoment: () => void;
+  hasAnything: boolean;
 }
 
 const InboxHeader = React.memo(function InboxHeader({
   isDark,
   selectedDate,
+  isToday,
   onSelectDate,
   attentionCount,
   autoCount,
@@ -168,12 +191,33 @@ const InboxHeader = React.memo(function InboxHeader({
   onFilterChange,
   selectedSpace,
   onOpenSpaceSheet,
+  briefingVersion,
+  showFirstMoment,
+  onDismissFirstMoment,
+  hasAnything,
 }: InboxHeaderProps) {
   const P = palette(isDark);
   const A = accent(isDark);
 
+  const dayLabel = selectedDate.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'short' });
+
   return (
     <View>
+    {/* ═══ Section 1: Today ══════════════════════════════════════════════
+        The first thing on the screen is the question the app exists to
+        answer. The peak moment sits above it, once, the day the first real
+        insight arrives. */}
+    {showFirstMoment && <FirstInsightMoment onDismiss={onDismissFirstMoment} />}
+    {/* Not gated on the inbox having something in it. The inbox store holds
+        only what is still *waiting*, and both of these are about what is not:
+        the briefing counts tracked bills and yesterday's spend, and the
+        suggestion appears precisely when you have just cleared the queue by
+        handling the same thing for the third time. Each returns null when it
+        has nothing to say. */}
+    {isToday && <TodayBriefing isDark={isDark} version={briefingVersion} />}
+    {/* The one place Niva takes the initiative: "always do this?", offered
+        once, after the same decision has been made by hand three times. */}
+    {isToday && <SuggestionCard isDark={isDark} version={briefingVersion} />}
 
     {/* ═══ Section 2: Calendar ══════════════════════════════════════════ */}
     <View style={[styles.calendarSection, { borderBottomColor: P.stroke }]}>
@@ -193,15 +237,12 @@ const InboxHeader = React.memo(function InboxHeader({
 
     {/* ═══ Section 3: Inbox Header ══════════════════════════════════════ */}
     <View style={styles.inboxSection}>
-      {/* No count badge beside the title. It sat directly above a sentence
-          that opens with the same number - "Inbox (6)" over "6 things need your
-          attention" - which is the same fact twice, a line apart. The sentence
-          is the one that survives: it is warmer, and it says what the number
-          means. */}
       <Text style={[styles.inboxTitle, { color: P.ink }]}>Inbox</Text>
       {attentionCount > 0 && (
         <Text style={[styles.inboxSubtitle, { color: P.inkMuted }]}>
-          {attentionCount} {attentionCount === 1 ? 'thing' : 'things'} need your attention
+          {isToday
+            ? `${attentionCount} waiting · most urgent first`
+            : `${attentionCount} noticed on ${dayLabel}`}
         </Text>
       )}
 
@@ -259,18 +300,121 @@ const InboxHeader = React.memo(function InboxHeader({
   );
 });
 
+/* -- Engine status line ---------------------------------------------------
+   What the engine is doing, in one sentence, with the one control that
+   matters when it is stuck. Shared by both empty states. */
+function EngineStatus({ isDark }: { isDark: boolean }) {
+  const P = palette(isDark);
+  const A = accent(isDark);
+  const engineReady = useModelStore((st) => st.engineReady);
+  const status = useModelStore((st) => st.status);
+  const progress = useModelStore((st) => st.progress);
+  const allowMobileData = useModelStore((st) => st.allowMobileData);
+
+  const text =
+    engineReady ? 'Active — watching your notifications'
+    : status === 'downloading' ? `Preparing the engine · ${Math.round(progress * 100)}%`
+    : status === 'preparing' ? 'Almost ready…'
+    : status === 'waiting_wifi' ? 'Engine will download on Wi-Fi'
+    : status === 'error' ? 'Engine download failed — check Settings'
+    : 'Engine initializing…';
+
+  return (
+    <View style={[styles.emptyStatusCard, { backgroundColor: P.canvasSubtle, borderColor: P.stroke }]}>
+      <View style={styles.emptyStatusRow}>
+        <View style={[styles.emptyStatusDot, { backgroundColor: engineReady ? A.success : A.warning }]} />
+        <Text style={[styles.emptyStatusText, { color: P.inkSecondary }]}>{text}</Text>
+      </View>
+      {status === 'waiting_wifi' && (
+        <TouchableOpacity
+          onPress={() => allowMobileData().catch(() => {})}
+          activeOpacity={0.7}
+          style={styles.emptyStatusAction}
+          accessibilityRole="button"
+        >
+          <Wifi size={13} color={A.brand} strokeWidth={2.25} />
+          <Text style={[styles.emptyStatusActionText, { color: A.brand }]}>Download on mobile data instead</Text>
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+}
+
+/* -- Try it ---------------------------------------------------------------
+   Real messages through the real pipeline. This replaces the mock inbox
+   that used to be painted onto every fresh install. */
+interface SamplesState {
+  running: boolean;
+  done: number;
+  total: number;
+  created: number;
+}
+
+function TrySamples({
+  isDark,
+  state,
+  onRun,
+}: {
+  isDark: boolean;
+  state: SamplesState | null;
+  onRun: () => void;
+}) {
+  const P = palette(isDark);
+  const A = accent(isDark);
+  const engineReady = useModelStore((st) => st.engineReady);
+
+  if (!engineReady) return null;
+
+  if (state?.running) {
+    return (
+      <View style={[styles.samplesCard, { backgroundColor: P.surface, borderColor: P.stroke }]}>
+        <Text style={[styles.samplesTitle, { color: P.ink }]}>
+          Reading sample messages · {state.done}/{state.total}
+        </Text>
+        <View style={[styles.samplesTrack, { backgroundColor: P.inkFaint }]}>
+          <View style={[styles.samplesFill, { backgroundColor: A.brand, width: `${Math.max(4, Math.round((state.done / state.total) * 100))}%` }]} />
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <TouchableOpacity
+      onPress={onRun}
+      activeOpacity={0.8}
+      style={[styles.samplesCard, styles.samplesButton, { backgroundColor: P.surface, borderColor: P.stroke }]}
+      accessibilityRole="button"
+      accessibilityLabel="See Niva in action with sample messages"
+    >
+      <View style={[styles.samplesIcon, { backgroundColor: A.brandSoft }]}>
+        <Sparkles size={16} color={A.brand} strokeWidth={2.25} />
+      </View>
+      <View style={{ flex: 1 }}>
+        <Text style={[styles.samplesTitle, { color: P.ink }]}>See Niva in action</Text>
+        <Text style={[styles.samplesSub, { color: P.inkMuted }]}>
+          Runs {SAMPLE_SIGNALS.length} real-looking messages — a bill, a parcel, a flight — through the engine on your phone.
+        </Text>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
 /* -- Empty state ----------------------------------------------------------
    Module scope for the same reason as the header: `ListEmptyComponent` is
    also reconciled by type. */
 const InboxEmpty = React.memo(function InboxEmpty({
   isDark,
-  engineReady,
   isCapturing,
+  isToday,
+  samples,
+  onRunSamples,
 }: {
   isDark: boolean;
-  engineReady: boolean;
   /** Whether any source is actually granted. It changes what "empty" means. */
   isCapturing: boolean;
+  isToday: boolean;
+  samples: SamplesState | null;
+  onRunSamples: () => void;
 }) {
   const P = palette(isDark);
   const A = accent(isDark);
@@ -298,6 +442,21 @@ const InboxEmpty = React.memo(function InboxEmpty({
         <View style={styles.emptySourcesWrap}>
           <SignalSourcesCard isDark={isDark} variant="compact" />
         </View>
+
+        <View style={styles.emptySourcesWrap}>
+          <TrySamples isDark={isDark} state={samples} onRun={onRunSamples} />
+        </View>
+      </Animated.View>
+    );
+  }
+
+  if (!isToday) {
+    return (
+      <Animated.View entering={FadeIn.duration(DURATION.slow)} style={styles.emptyWrap}>
+        <Text style={[styles.emptyTitle, { color: P.ink }]}>Nothing noticed that day</Text>
+        <Text style={[styles.emptyBody, { color: P.inkMuted }]}>
+          Only messages that arrived on this date show here.{'\n'}Today shows everything still waiting.
+        </Text>
       </Animated.View>
     );
   }
@@ -316,14 +475,16 @@ const InboxEmpty = React.memo(function InboxEmpty({
       Niva will keep watching.
     </Text>
 
-    {/* Engine status */}
-    <View style={[styles.emptyStatusCard, { backgroundColor: P.canvasSubtle, borderColor: P.stroke }]}>
-      <View style={styles.emptyStatusRow}>
-        <View style={[styles.emptyStatusDot, { backgroundColor: engineReady ? A.success : A.warning }]} />
-        <Text style={[styles.emptyStatusText, { color: P.inkSecondary }]}>
-          {engineReady ? 'Active — Monitoring notifications' : 'Engine initializing…'}
-        </Text>
-      </View>
+    <EngineStatus isDark={isDark} />
+
+    {samples && !samples.running && samples.created === 0 && samples.done > 0 ? (
+      <Text style={[styles.emptyHint, { color: P.inkDim, marginTop: SPACING.md }]}>
+        The samples ran, but nothing was created — they may already be in your inbox from an earlier run.
+      </Text>
+    ) : null}
+
+    <View style={styles.emptySourcesWrap}>
+      <TrySamples isDark={isDark} state={samples} onRun={onRunSamples} />
     </View>
   </Animated.View>
   );
@@ -337,7 +498,9 @@ const InboxEmpty = React.memo(function InboxEmpty({
    An OTP is not an insight and must never become a card: it is worth about
    sixty seconds, and a card would still be sitting in the inbox tomorrow. A
    chip above the list that expires with the code is the right shape for
-   something this urgent and this disposable. */
+   something this urgent and this disposable. It copies on tap, because a
+   code you have to retype is a code you might as well have read off the
+   notification. */
 const OtpChip = React.memo(function OtpChip({
   code,
   isDark,
@@ -349,6 +512,23 @@ const OtpChip = React.memo(function OtpChip({
 }) {
   const P = palette(isDark);
   const A = accent(isDark);
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (timer.current) clearTimeout(timer.current);
+  }, []);
+
+  const copy = useCallback(async () => {
+    try {
+      await Clipboard?.setStringAsync(code);
+      setCopied(true);
+      if (timer.current) clearTimeout(timer.current);
+      timer.current = setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // The clipboard is unavailable in some sandboxes. The code is still on screen.
+    }
+  }, [code]);
 
   return (
     <Animated.View
@@ -356,10 +536,13 @@ const OtpChip = React.memo(function OtpChip({
       style={[styles.otpChip, { backgroundColor: A.brandSoft, borderColor: A.brand }]}
     >
       <KeyRound size={16} color={A.brand} strokeWidth={2} />
-      <View style={{ flex: 1 }}>
-        <Text style={[styles.otpLabel, { color: P.inkMuted }]}>Verification code</Text>
+      <TouchableOpacity style={{ flex: 1 }} onPress={copy} activeOpacity={0.7} accessibilityLabel={`Copy code ${code}`}>
+        <Text style={[styles.otpLabel, { color: P.inkMuted }]}>{copied ? 'Copied' : 'Verification code · tap to copy'}</Text>
         <Text style={[styles.otpCode, { color: A.brand }]}>{code}</Text>
-      </View>
+      </TouchableOpacity>
+      <TouchableOpacity onPress={copy} hitSlop={12} accessibilityLabel="Copy code">
+        {copied ? <Check size={16} color={A.success} strokeWidth={2.5} /> : <Copy size={16} color={A.brand} strokeWidth={2} />}
+      </TouchableOpacity>
       <TouchableOpacity onPress={onDismiss} hitSlop={12} accessibilityLabel="Dismiss code">
         <X size={16} color={P.inkMuted} strokeWidth={2} />
       </TouchableOpacity>
@@ -367,18 +550,21 @@ const OtpChip = React.memo(function OtpChip({
   );
 });
 
+function isSameDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
 export default function HomeScreen() {
   // Selectors, not bare `useStore()`. A bare read subscribes to every field in
   // the store, so an unrelated write (a category load, a watch toggle) re-ran
   // this whole screen and rebuilt the list.
-  const realInsights = useInboxStore((st) => st.insights);
+  const insights = useInboxStore((st) => st.insights);
   const isLoading = useInboxStore((st) => st.isLoading);
   const loadInbox = useInboxStore((st) => st.loadInbox);
   const trackInsight = useInboxStore((st) => st.trackInsight);
   const remindInsight = useInboxStore((st) => st.remindInsight);
   const calendarInsight = useInboxStore((st) => st.calendarInsight);
   const dismissInsight = useInboxStore((st) => st.dismissInsight);
-  const engineReady = useModelStore((st) => st.engineReady);
   const latestOtp = useInboxStore((st) => st.latestOtp);
   const clearOtp = useInboxStore((st) => st.clearOtp);
   const notificationsGranted = useCaptureStore((st) => st.notificationsGranted);
@@ -391,29 +577,59 @@ export default function HomeScreen() {
   const [activeFilter, setActiveFilter] = useState<'all' | 'auto' | 'review'>('all');
   const [selectedSpace, setSelectedSpace] = useState<string | null>(null);
   const [showSpaceSheet, setShowSpaceSheet] = useState(false);
+  const [samples, setSamples] = useState<SamplesState | null>(null);
+  const [showFirstMoment, setShowFirstMoment] = useState(false);
   const categories = useCategoryStore((st) => st.categories);
   const loadCategories = useCategoryStore((st) => st.loadCategories);
   const getAccent = useCategoryStore((st) => st.getAccent);
-  const { consumeReset } = useTabReset();
 
   // Reset filters/date when re-tapping Inbox in the dock.
-  useEffect(() => {
-    if (consumeReset('home')) {
-      setSelectedDate(new Date());
-      setActiveFilter('all');
-      setSelectedSpace(null);
-    }
-  }, [consumeReset]);
+  useTabResetHandler('home', () => {
+    setSelectedDate(new Date());
+    setActiveFilter('all');
+    setSelectedSpace(null);
+  });
 
   useEffect(() => { loadInbox(); loadCategories(); }, [loadInbox, loadCategories]);
 
-  const insights = useMemo(() => {
-    if (realInsights.length > 0) return realInsights;
-    return USE_MOCK_DATA ? (MOCK_INSIGHTS as unknown as Insight[]) : [];
-  }, [realInsights]);
+  /**
+   * The peak moment, once.
+   *
+   * Checked when the inbox first has something real in it. The flag is in
+   * the database rather than component state so it survives restarts — and
+   * so it is set exactly once in the life of the install.
+   */
+  useEffect(() => {
+    if (insights.length === 0) return;
+    let cancelled = false;
+    getFirstInsightSeen()
+      .then((seen) => {
+        if (!cancelled && !seen) setShowFirstMoment(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [insights.length]);
 
-  // Filter by selected date — inbox items only
+  const dismissFirstMoment = useCallback(() => {
+    setShowFirstMoment(false);
+    setFirstInsightSeen().catch(() => {});
+  }, []);
+
+  const isToday = isSameDay(selectedDate, new Date());
+
+  /**
+   * What the selected day shows.
+   *
+   * Today is *everything still waiting*, most urgent first — an overdue bill
+   * captured on Monday must not vanish from the inbox on Tuesday. Any other
+   * day is a journal: what arrived on that date. The old behaviour filtered
+   * today by capture date too, which hid exactly the items the app exists to
+   * surface.
+   */
   const dateFiltered = useMemo(() => {
+    if (isToday) return insights.filter((i) => i.status === 'inbox');
     const selYear = selectedDate.getFullYear();
     const selMonth = selectedDate.getMonth();
     const selDay = selectedDate.getDate();
@@ -426,20 +642,20 @@ export default function HomeScreen() {
         d.getDate() === selDay
       );
     });
-  }, [insights, selectedDate]);
+  }, [insights, selectedDate, isToday]);
 
   // Apply confidence + space filter
   const filteredInsights = useMemo(() => {
     let result = dateFiltered;
-    if (activeFilter === 'auto') result = result.filter((i) => i.confidence >= 0.85);
-    if (activeFilter === 'review') result = result.filter((i) => i.confidence < 0.85);
+    if (activeFilter === 'auto') result = result.filter((i) => i.confidence >= CONFIDENCE_GATE);
+    if (activeFilter === 'review') result = result.filter((i) => i.confidence < CONFIDENCE_GATE);
     if (selectedSpace) result = result.filter((i) => i.category === selectedSpace);
     return result;
   }, [dateFiltered, activeFilter, selectedSpace]);
 
   const attentionCount = dateFiltered.length;
-  const autoCount = dateFiltered.filter((i) => i.confidence >= 0.85).length;
-  const reviewCount = dateFiltered.filter((i) => i.confidence < 0.85).length;
+  const autoCount = dateFiltered.filter((i) => i.confidence >= CONFIDENCE_GATE).length;
+  const reviewCount = dateFiltered.filter((i) => i.confidence < CONFIDENCE_GATE).length;
 
   const renderItem = useCallback(
     ({ item }: { item: Insight }) => (
@@ -447,15 +663,22 @@ export default function HomeScreen() {
         insight={item}
         isDark={isDark}
         onTrack={() => trackInsight(item.id)}
-        onRemind={() => remindInsight(item.id)}
-        onCalendar={() => calendarInsight(item.id)}
+        onRemind={() => { remindInsight(item.id).catch(() => {}); }}
+        onCalendar={() => { calendarInsight(item.id).catch(() => {}); }}
         onIgnore={() => dismissInsight(item.id)}
       />
     ),
     [isDark, trackInsight, remindInsight, calendarInsight, dismissInsight],
   );
 
-
+  const runSamples = useCallback(async () => {
+    setSamples({ running: true, done: 0, total: SAMPLE_SIGNALS.length, created: 0 });
+    const tally = await runSampleSignals((done, total) => {
+      setSamples((s) => (s ? { ...s, done, total } : s));
+    });
+    await loadInbox();
+    setSamples({ running: false, done: SAMPLE_SIGNALS.length, total: SAMPLE_SIGNALS.length, created: tally.created });
+  }, [loadInbox]);
 
   // Stable callbacks, so `InboxHeader`'s memo actually holds. A fresh arrow
   // per render would defeat it and re-render the calendar on every keystroke
@@ -466,7 +689,6 @@ export default function HomeScreen() {
     setSelectedSpace(key);
     setShowSpaceSheet(false);
   }, []);
-
 
   return (
     <SafeAreaView style={[styles.screen, { backgroundColor: P.canvas }]} edges={[]}>
@@ -485,6 +707,7 @@ export default function HomeScreen() {
           <InboxHeader
             isDark={isDark}
             selectedDate={selectedDate}
+            isToday={isToday}
             onSelectDate={setSelectedDate}
             attentionCount={attentionCount}
             autoCount={autoCount}
@@ -493,20 +716,29 @@ export default function HomeScreen() {
             onFilterChange={setActiveFilter}
             selectedSpace={selectedSpace}
             onOpenSpaceSheet={openSpaceSheet}
+            /* The array itself is the version: the store hands out a new one
+               whenever the inbox moves, and the briefing counts tracked items
+               too, so any movement is a reason to re-read. */
+            briefingVersion={insights}
+            showFirstMoment={showFirstMoment}
+            onDismissFirstMoment={dismissFirstMoment}
+            hasAnything={insights.length > 0}
           />
         }
         ListFooterComponent={null}
         ListEmptyComponent={
           <InboxEmpty
             isDark={isDark}
-            engineReady={engineReady}
             /* On a build that cannot capture at all — iOS, Expo Go — the
                permission prompt would be a dead end, so the ordinary empty
                state is the honest one there. */
             isCapturing={!captureSupported || notificationsGranted || smsGranted}
+            isToday={isToday}
+            samples={samples}
+            onRunSamples={runSamples}
           />
         }
-        contentContainerStyle={filteredInsights.length === 0 ? { flex: 1 } : { paddingBottom: 96 }}
+        contentContainerStyle={filteredInsights.length === 0 ? { flexGrow: 1, paddingBottom: 96 } : { paddingBottom: 96 }}
         onScroll={reportInteraction}
         scrollEventThrottle={50}
         refreshControl={
@@ -574,20 +806,10 @@ const styles = StyleSheet.create({
   screen: { flex: 1 },
 
   // ═══ Section 2: Calendar ═══════════════════════════════════════════════
-  // No top rule: ScreenHeader's own bottom rule already closes the chrome
-  // above, and two hairlines a few pixels apart read as a rendering bug.
-  // No bottom rule any more.
-  // The AppBar's hairline already marks where chrome ends. A second one under
-  // the calendar boxed this band in between two lines a hundred pixels apart,
-  // and the "Inbox" heading below is a perfectly good divider on its own -
-  // headings are what separate sections; rules are what separate chrome from
-  // content, and there is only one of those boundaries on this screen.
   calendarSection: {
     paddingTop: SPACING.sm,
     paddingBottom: SPACING.xs,
   },
-  // The gap above the week row. The day arrows and the seven day cells are
-  // separate controls and need to read that way.
   calendarInner: {
     paddingBottom: 6,
   },
@@ -598,7 +820,6 @@ const styles = StyleSheet.create({
     paddingTop: SPACING.base,
     paddingBottom: SPACING.sm,
   },
-  // Same role the other four tabs use, so "Inbox" is not a size of its own.
   inboxTitle: { ...TYPE.screenTitle },
   inboxSubtitle: {
     ...TYPE.caption,
@@ -690,8 +911,6 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
 
-
-
   // ═══ OTP chip ══════════════════════════════════════════════════════════
   otpChip: {
     flexDirection: 'row',
@@ -719,7 +938,7 @@ const styles = StyleSheet.create({
   // ═══ Empty State ═══════════════════════════════════════════════════════
   emptyWrap: {
     paddingHorizontal: SPACING.base,
-    paddingTop: SPACING.xxl + SPACING.lg,
+    paddingTop: SPACING.xl,
     alignItems: 'center',
   },
   emptyIconCircle: {
@@ -748,18 +967,18 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 16,
     marginBottom: SPACING.lg,
+    textAlign: 'center',
   },
   emptySourcesWrap: {
     alignSelf: 'stretch',
-    marginTop: SPACING.lg,
-    marginHorizontal: SPACING.base,
+    marginTop: SPACING.md,
   },
   emptyStatusCard: {
     padding: SPACING.md,
     borderRadius: RADIUS.lg,
     borderWidth: StyleSheet.hairlineWidth,
     alignSelf: 'stretch',
-    marginHorizontal: SPACING.base,
+    gap: SPACING.sm,
   },
   emptyStatusRow: {
     flexDirection: 'row',
@@ -775,5 +994,57 @@ const styles = StyleSheet.create({
     fontFamily: FONT.semibold,
     fontSize: 12,
     lineHeight: 16,
+    flex: 1,
+  },
+  emptyStatusAction: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.xs,
+    paddingLeft: SPACING.base,
+  },
+  emptyStatusActionText: {
+    fontFamily: FONT.semibold,
+    fontSize: 12,
+    lineHeight: 16,
+  },
+
+  // ═══ Samples ═══════════════════════════════════════════════════════════
+  samplesCard: {
+    padding: SPACING.base,
+    borderRadius: RADIUS.lg,
+    borderWidth: 1,
+    gap: SPACING.sm,
+  },
+  samplesButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.md,
+  },
+  samplesIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: RADIUS.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  samplesTitle: {
+    fontFamily: FONT.semibold,
+    fontSize: 14,
+    lineHeight: 19,
+  },
+  samplesSub: {
+    fontFamily: FONT.regular,
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: 2,
+  },
+  samplesTrack: {
+    height: 4,
+    borderRadius: RADIUS.pill,
+    overflow: 'hidden',
+  },
+  samplesFill: {
+    height: '100%',
+    borderRadius: RADIUS.pill,
   },
 });

@@ -61,7 +61,7 @@ const NEEDLE_TOOLS: CactusLMTool[] = [
       properties: {
         bill_type: { type: 'string', description: 'Type of bill e.g. electricity, credit_card' },
         amount_due: { type: 'number', description: 'Amount due' },
-        due_date: { type: 'string', description: 'Due date as YYYY-MM-DD or natural language like "25th August"' },
+        due_date: { type: 'string', description: 'Due date exactly as written in the message, e.g. "24-08" or "25th August"' },
         biller_name: { type: 'string', description: 'Biller or provider name' },
       },
       required: ['bill_type', 'due_date'],
@@ -78,7 +78,7 @@ const NEEDLE_TOOLS: CactusLMTool[] = [
         status: { type: 'string', description: 'Status e.g. shipped, out_for_delivery, delivered' },
         tracking_id: { type: 'string', description: 'Tracking or AWB number' },
         otp: { type: 'string', description: 'Delivery OTP if present in the message' },
-        estimated_arrival: { type: 'string', description: 'Estimated arrival date or time' },
+        estimated_arrival: { type: 'string', description: 'Estimated arrival date or time exactly as written' },
       },
       required: ['provider', 'status'],
     },
@@ -94,7 +94,7 @@ const NEEDLE_TOOLS: CactusLMTool[] = [
         booking_id: { type: 'string', description: 'Booking ID, PNR, or confirmation number' },
         origin: { type: 'string', description: 'Departure location' },
         destination: { type: 'string', description: 'Arrival location' },
-        departure_time: { type: 'string', description: 'Departure time' },
+        departure_time: { type: 'string', description: 'Departure date and time exactly as written' },
         arrival_time: { type: 'string', description: 'Arrival time' },
       },
       required: ['transport_type'],
@@ -108,7 +108,7 @@ const NEEDLE_TOOLS: CactusLMTool[] = [
       type: 'object',
       properties: {
         title: { type: 'string', description: 'Task or event title' },
-        deadline: { type: 'string', description: 'Date and time of the task' },
+        deadline: { type: 'string', description: 'Date and time of the task exactly as written' },
         urgency: { type: 'string', description: 'low, medium, or high' },
       },
       required: ['title'],
@@ -116,10 +116,51 @@ const NEEDLE_TOOLS: CactusLMTool[] = [
   },
 ];
 
+/**
+ * The line between Auto and Review. Mirrors the inbox and the watch matcher,
+ * which both split at this value.
+ */
+export const CONFIDENCE_GATE = 0.85;
+
+/**
+ * A confidence the rest of the app can trust.
+ *
+ * When the runtime scores the call, that score wins. When it does not — an
+ * older weight build, a tool-only completion path that skips scoring — a
+ * constant would be dishonest in either direction, so this reads the two
+ * signals that are always present: whether the runtime itself flagged the
+ * result as weak, and whether the call actually filled in the fields the tool
+ * marks as required. A call that names an expense but not its amount is a
+ * guess, however sure the model sounded.
+ */
+export function resolveConfidence(
+  reported: number | undefined,
+  weak: boolean | undefined,
+  call: { name: string; arguments: Record<string, unknown> },
+): number {
+  if (typeof reported === 'number' && Number.isFinite(reported)) {
+    return Math.max(0, Math.min(1, reported));
+  }
+  let score = 0.9;
+  if (weak) score -= 0.2;
+  const spec = NEEDLE_TOOLS.find((t) => t.name === call.name);
+  const missing =
+    spec?.parameters.required.filter((k) => {
+      const v = call.arguments?.[k];
+      return v === undefined || v === null || v === '';
+    }).length ?? 0;
+  score -= missing * 0.15;
+  return Math.max(0.3, Math.min(1, score));
+}
+
 // ─── System Prompt ────────────────────────────────────────────────────────────
-const NEEDLE_SYSTEM_PROMPT = `You are a precise event classification agent. 
+// Dates are asked for verbatim on purpose. Converting "24-08" to a real date
+// is deterministic work (see utils/dates), and a 350M-parameter model asked
+// to do it is a model asked to invent a year.
+const NEEDLE_SYSTEM_PROMPT = `You are a precise event classification agent.
 Analyze the incoming message and call the single most appropriate tool.
-Extract all relevant entities accurately. 
+Extract all relevant entities accurately.
+Copy dates and times exactly as written in the message — do not convert or reformat them.
 If no tool applies (promotional spam, OTP, social notification), respond with: {"is_noise": true}
 Never guess — if an entity is absent from the message, omit it.`;
 
@@ -144,14 +185,52 @@ class NeedleEngineClass {
 
     const messages: CactusLMMessage[] = [
       { role: 'system', content: NEEDLE_SYSTEM_PROMPT },
-      { role: 'user', content: rawText }
+      { role: 'user', content: rawText },
     ];
 
     const result = await this.lm.complete({
       messages,
-      options: { temperature: 0.0 },
+      options: {
+        temperature: 0.0,
+        /**
+         * Off, and it has to be said explicitly: the runtime defaults it on,
+         * and the native library links libcurl with two endpoints baked in.
+         * A product whose whole pitch is that messages never leave the phone
+         * cannot ship an inference engine that reports home per request.
+         */
+        telemetryEnabled: false,
+        /**
+         * What makes `result.confidence` real.
+         *
+         * The runtime only scores a completion when asked to, by giving it a
+         * threshold. Without this every call came back with no confidence at
+         * all, the fallback made it a constant, and the Auto/Review split in
+         * the inbox — the app's whole stance on trust — was inert.
+         *
+         * The threshold is also the runtime's cue for a `cloudHandoff` hint.
+         * That is a boolean in the result and nothing more: this SDK has no
+         * cloud call and no endpoint to make one to, so a low score is a flag
+         * we read, never a request that leaves the device.
+         */
+        confidenceThreshold: CONFIDENCE_GATE,
+      },
       tools: NEEDLE_TOOLS,
     });
+
+    /**
+     * A completion that failed is not a message about nothing.
+     *
+     * The runtime reports a failed inference as `success: false` with an empty
+     * response rather than by throwing — which, read as "no tool call", is
+     * indistinguishable here from "this is promotional noise". The pipeline
+     * then marks the signal `filtered_out` and it is never looked at again, so
+     * one runtime hiccup permanently loses a real bank alert. Throwing hands it
+     * to the caller's `classification_failed` branch instead, which leaves the
+     * signal `pending` for the next foreground to retry.
+     */
+    if (result.success === false) {
+      throw new Error('Engine reported a failed completion');
+    }
 
     if (result.functionCalls && result.functionCalls.length > 0) {
       const call = result.functionCalls[0];
@@ -159,7 +238,7 @@ class NeedleEngineClass {
         category: toolNameToCategory(call.name),
         toolName: call.name,
         arguments: call.arguments,
-        confidence: result.confidence ?? 0.85,
+        confidence: resolveConfidence(result.confidence, result.cloudHandoff, call),
         reasoning: result.thinking ?? '',
       };
     }
@@ -174,6 +253,35 @@ class NeedleEngineClass {
     return null; // No function call and not noise, discard
   }
 
+  /**
+   * Read a watch sentence into its parts.
+   *
+   * The same engine, a different tool: "track everything I spend on Swiggy
+   * and Zomato over 500" → merchants, an amount bound. Structured output
+   * only — the caller merges it with the deterministic parser and shows the
+   * result back before saving, so nothing here is ever applied unseen.
+   */
+  async extractWatchRule(sentence: string): Promise<Record<string, unknown> | null> {
+    if (!this.lm) return null;
+    const result = await this.lm.complete({
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You turn a personal rule, written in plain language, into a structured filter. ' +
+            'Call define_watch once. Copy merchant and sender names exactly as written. ' +
+            'Omit any field the sentence does not state.',
+        },
+        { role: 'user', content: sentence },
+      ],
+      options: { temperature: 0.0, telemetryEnabled: false, confidenceThreshold: CONFIDENCE_GATE },
+      tools: [WATCH_RULE_TOOL],
+    });
+    const call = result.functionCalls?.[0];
+    if (!call || call.name !== WATCH_RULE_TOOL.name) return null;
+    return call.arguments ?? null;
+  }
+
   release(): void {
     this.lm = null;
   }
@@ -182,6 +290,23 @@ class NeedleEngineClass {
     return this.lm !== null;
   }
 }
+
+const WATCH_RULE_TOOL: CactusLMTool = {
+  name: 'define_watch',
+  description:
+    'Called to turn a personal rule such as "track all my food spending on Swiggy over 500" into a filter.',
+  parameters: {
+    type: 'object',
+    properties: {
+      merchants: { type: 'string', description: 'Merchant, biller, app or sender names mentioned, comma separated, exactly as written' },
+      keywords: { type: 'string', description: 'Other words that identify the messages, comma separated' },
+      min_amount: { type: 'number', description: 'Only amounts over this, if the rule says so' },
+      max_amount: { type: 'number', description: 'Only amounts under this, if the rule says so' },
+      days_before: { type: 'number', description: 'For reminders: how many days before the due date' },
+    },
+    required: [],
+  },
+};
 
 function toolNameToCategory(toolName: string): SignalCategory {
   const map: Record<string, SignalCategory> = {

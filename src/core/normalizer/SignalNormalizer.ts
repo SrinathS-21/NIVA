@@ -16,7 +16,9 @@ export type NoiseReason =
   | 'promotional'
   | 'social'
   | 'system'
-  | 'empty';
+  | 'empty'
+  /** Nothing but a link. There is no consequence in a URL. */
+  | 'link';
 
 export interface NormalizedSignal {
   cleanText: string;
@@ -59,18 +61,41 @@ const SYSTEM_NOISE = [
 
 // ─── Normalization Rules ──────────────────────────────────────────────────────
 
+/**
+ * One grouped number, in either convention.
+ *
+ * Both Indian and Western grouping share one property: the rightmost group is
+ * always exactly three digits, and every group left of it is two (lakh, crore)
+ * or three (thousand, million). Matching the number *whole* and stripping its
+ * commas afterwards is therefore the only reliable way to do this in one pass.
+ *
+ * The two rules this replaces went comma by comma and could not. `replace`
+ * resumes after the text it consumed, so on "1,234,567" the first match ate
+ * "1,234" and the scan restarted at ",567" — no digits in front of it, no
+ * further match — leaving "1234,567", which the model reads as 1234, or as two
+ * numbers. Indian grouping survived by accident, the two rules interlocking on
+ * exactly the shape this app sees most, which is why it went unnoticed.
+ *
+ * The leading group is a character rather than a lookbehind so this stays
+ * legal on every engine the app runs on. `(?!\d)` at the end keeps the match
+ * off the tail of a longer digit run, and a pair like a "12,34" reference
+ * number is left alone — it has no three-digit group to end on.
+ */
+const GROUPED_NUMBER = /(^|[^\d,])(\d{1,3}(?:,\d{2,3})*,\d{3})(?!\d)/g;
+
 function normalizeCurrency(text: string): string {
-  return text
-    // Standardize currency symbols to text
-    .replace(/₹\s*/g, 'INR ')
-    .replace(/\$\s*/g, 'USD ')
-    .replace(/£\s*/g, 'GBP ')
-    .replace(/€\s*/g, 'EUR ')
-    // Remove commas in numbers: 1,42,500 → 142500
-    .replace(/(\d+),(\d{2},\d{3})/g, '$1$2')  // Indian lakh format
-    .replace(/(\d+),(\d{3})/g, '$1$2')          // Standard thousand separator
-    // Remove trailing .00 noise
-    .replace(/\.00\b/g, '');
+  return (
+    text
+      // Standardize currency symbols to text
+      .replace(/₹\s*/g, 'INR ')
+      .replace(/\$\s*/g, 'USD ')
+      .replace(/£\s*/g, 'GBP ')
+      .replace(/€\s*/g, 'EUR ')
+      // Remove commas in numbers: 1,42,500 → 142500, 1,234,567 → 1234567
+      .replace(GROUPED_NUMBER, (_m, before: string, number: string) => before + number.replace(/,/g, ''))
+      // Remove trailing .00 noise
+      .replace(/\.00\b/g, '')
+  );
 }
 
 function normalizeWhitespace(text: string): string {
@@ -85,6 +110,12 @@ export function normalizeSignal(rawText: string): NormalizeResult {
   }
 
   const text = rawText.trim();
+
+  // 0. A bare link — what "share to Niva" from a browser sends. Nothing to
+  //    understand without the page, and fetching the page is off the table.
+  if (/^(?:\s*https?:\/\/\S+\s*)+$/i.test(text)) {
+    return { signal: null, discarded: true, noiseReason: 'link' };
+  }
 
   // 1. OTP check — extract OTP but still discard from full pipeline
   const otpMatch = OTP_PATTERN.exec(text) ?? OTP_INLINE.exec(text);

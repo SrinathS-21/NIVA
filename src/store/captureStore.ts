@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import {
   isCaptureSupported,
+  isSmsCaptureAvailable,
   isNotificationAccessGranted,
   isSmsPermissionGranted,
   openNotificationAccessSettings,
@@ -18,6 +19,8 @@ import { drainPendingSignals } from '../core/IngestionService';
 interface CaptureState {
   /** False on iOS, in Expo Go, and in any build made before the last prebuild. */
   supported: boolean;
+  /** False in store builds, where the SMS receiver is compiled out. */
+  smsAvailable: boolean;
   /** OS-level: may we read the shade / receive SMS. */
   notificationsGranted: boolean;
   smsGranted: boolean;
@@ -50,6 +53,7 @@ interface CaptureState {
  */
 export const useCaptureStore = create<CaptureState>((set, get) => ({
   supported: isCaptureSupported,
+  smsAvailable: isSmsCaptureAvailable,
   notificationsGranted: false,
   smsGranted: false,
   notificationsEnabled: true,

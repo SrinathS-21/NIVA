@@ -2,12 +2,17 @@ import { create } from 'zustand';
 import {
   type Insight,
   getInboxInsights,
+  getInsightById,
   updateInsightStatus,
 } from '../db/repositories/insights';
 import { insertAction, type Action } from '../db/repositories/actions';
 import { randomUUID } from 'expo-crypto';
 import { scoreInsightUrgency } from '../utils/urgency';
 import { useSpaceMetricsStore } from './spaceMetricsStore';
+import { scheduleReminder, cancelReminder } from '../core/notify/Reminders';
+import { addInsightToCalendar, type CalendarOutcome } from '../core/calendar/CalendarBridge';
+import { rescheduleDigestsSoon } from '../core/digest/DigestScheduler';
+import { shareInsightText } from '../core/share/ShareBridge';
 
 interface InboxState {
   insights: Insight[];
@@ -17,13 +22,23 @@ interface InboxState {
 
   loadInbox: () => Promise<void>;
   addInsight: (insight: Insight) => void;
+  /** Drop a card the pipeline has already resolved — a bill a payment settled. */
+  removeInsight: (id: string) => void;
   setLatestOtp: (code: string) => void;
   clearOtp: () => void;
   trackInsight: (id: string) => Promise<void>;
-  remindInsight: (id: string) => Promise<void>;
-  calendarInsight: (id: string) => Promise<void>;
+  /** Resolves with when the reminder will ring, or null if none could be set. */
+  remindInsight: (id: string) => Promise<Date | null>;
+  /** Resolves with what the calendar app did. */
+  calendarInsight: (id: string) => Promise<CalendarOutcome>;
   dismissInsight: (id: string) => Promise<void>;
   restoreInsight: (id: string) => Promise<void>;
+  /**
+   * Hand an insight to another app through the share sheet. Does not resolve
+   * the card — sending a bill to a spouse does not pay it. Resolves true if
+   * the sheet reported a share.
+   */
+  shareInsight: (id: string) => Promise<boolean>;
 }
 
 /**
@@ -35,23 +50,29 @@ interface InboxState {
  * together, though, is the metrics refresh: acting on an insight changes what
  * every space card says about itself, and four call sites is four places to
  * forget that.
+ *
+ * `payload` is provenance — who did it, and anything the action left behind
+ * that a later undo needs, such as the id of a reminder to cancel.
  */
 async function applyAction(
   id: string,
   actionType: Action['action_type'],
   status: Insight['status'],
+  payload: Record<string, unknown> = {},
 ): Promise<void> {
   await updateInsightStatus(id, status);
   await insertAction({
     id: randomUUID(),
     insight_id: id,
     action_type: actionType,
-    payload_json: JSON.stringify({ via: 'user' }),
+    payload_json: JSON.stringify({ via: 'user', ...payload }),
     executed_at: Date.now(),
   });
   // Fire-and-forget: the figures are a read model, and a failed refresh should
   // never make the action itself look like it failed.
   useSpaceMetricsStore.getState().load().catch(() => {});
+  // The briefing is a read model too. What is due tomorrow just changed.
+  rescheduleDigestsSoon();
 }
 
 /** How long an OTP stays worth showing. Most expire inside five minutes. */
@@ -99,6 +120,11 @@ export const useInboxStore = create<InboxState>((set, get) => ({
     useSpaceMetricsStore.getState().load().catch(() => {});
   },
 
+  removeInsight: (id) => {
+    set((state) => ({ insights: state.insights.filter((i) => i.id !== id) }));
+    useSpaceMetricsStore.getState().load().catch(() => {});
+  },
+
   setLatestOtp: (code) => set({ latestOtp: { code, at: Date.now() } }),
   clearOtp: () => set({ latestOtp: null }),
 
@@ -107,17 +133,44 @@ export const useInboxStore = create<InboxState>((set, get) => ({
     set((state) => ({ insights: state.insights.filter((i) => i.id !== id) }));
   },
 
+  /**
+   * "Remind me" now rings.
+   *
+   * It used to write an action row and stop. The row said "reminder set" in
+   * three places in the UI and nothing anywhere was going to remind anyone.
+   * The notification id is kept on the action so "put back in inbox" can
+   * cancel it — an insight you un-did must not still go off on Thursday.
+   */
   remindInsight: async (id) => {
-    await applyAction(id, 'remind', 'actioned');
+    const insight = get().insights.find((i) => i.id === id) ?? (await getInsightById(id));
+    const scheduled = insight ? await scheduleReminder(insight) : null;
+    await applyAction(id, 'remind', 'actioned', {
+      notificationId: scheduled?.id ?? null,
+      remindAt: scheduled?.at.getTime() ?? null,
+    });
     set((state) => ({ insights: state.insights.filter((i) => i.id !== id) }));
+    return scheduled?.at ?? null;
   },
 
+  /**
+   * Opens the calendar app with the event filled in.
+   *
+   * The dialog is the confirmation. On iOS a cancel comes back as such and
+   * nothing is recorded; on Android the OS cannot say, so the action is
+   * recorded as "opened in calendar" — which is exactly what happened.
+   */
   calendarInsight: async (id) => {
-    await applyAction(id, 'calendar', 'actioned');
+    const insight = get().insights.find((i) => i.id === id) ?? (await getInsightById(id));
+    const outcome: CalendarOutcome = insight ? await addInsightToCalendar(insight) : 'unavailable';
+    if (outcome === 'cancelled') return outcome;
+    await applyAction(id, 'calendar', 'actioned', { calendar: outcome });
     set((state) => ({ insights: state.insights.filter((i) => i.id !== id) }));
+    return outcome;
   },
 
   dismissInsight: async (id) => {
+    // An ignored item must not ring later.
+    await cancelReminder(id);
     await applyAction(id, 'ignore', 'dismissed');
     set((state) => ({ insights: state.insights.filter((i) => i.id !== id) }));
   },
@@ -130,8 +183,26 @@ export const useInboxStore = create<InboxState>((set, get) => ({
    * the only thing missing was this.
    */
   restoreInsight: async (id) => {
+    await cancelReminder(id);
     await updateInsightStatus(id, 'inbox');
     await get().loadInbox();
     useSpaceMetricsStore.getState().load().catch(() => {});
+    rescheduleDigestsSoon();
+  },
+
+  shareInsight: async (id) => {
+    const insight = get().insights.find((i) => i.id === id) ?? (await getInsightById(id));
+    if (!insight) return false;
+    const shared = await shareInsightText(insight);
+    if (shared) {
+      await insertAction({
+        id: randomUUID(),
+        insight_id: id,
+        action_type: 'share',
+        payload_json: JSON.stringify({ via: 'user' }),
+        executed_at: Date.now(),
+      });
+    }
+    return shared;
   },
 }));

@@ -256,12 +256,12 @@ function DockButton({
       onPressIn={() => {
         // Down is a timing: it has to be there on the frame you touch, and a
         // spring accelerating from rest is not.
-        press.value = withTiming(0.92, { duration: 40 });
+        press.set(withTiming(0.92, { duration: 40 }));
       }}
       onPressOut={() => {
         // Up is a spring, so the button returns under its own weight rather
         // than being put back.
-        press.value = withSpring(1, SPRING);
+        press.set(withSpring(1, SPRING));
       }}
       style={[styles.dockItem, animatedStyle]}
     >
@@ -345,7 +345,7 @@ export function FloatingDock({
    */
   const selectTo = useCallback(
     (index: number) => {
-      if (currIndex.value === index) return;
+      if (currIndex.get() === index) return;
 
       /**
        * Where the new hand-over starts.
@@ -359,10 +359,10 @@ export function FloatingDock({
        * full — a tab lighting up on its way out being precisely what makes a
        * dock look like it has two selections.
        */
-      progress.value = 1 - progress.value;
-      prevIndex.value = currIndex.value;
-      currIndex.value = index;
-      progress.value = withTiming(1, { duration: SELECT_MS, easing: EASE.out });
+      progress.set(1 - progress.get());
+      prevIndex.set(currIndex.get());
+      currIndex.set(index);
+      progress.set(withTiming(1, { duration: SELECT_MS, easing: EASE.out }));
     },
     [prevIndex, currIndex, progress],
   );

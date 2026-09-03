@@ -1,4 +1,20 @@
 This is an Expo/React Native mobile application. Prioritize mobile-first patterns, performance, and cross-platform compatibility.
+
+## Work tracking — read this first, every session
+`docs/WORKLOG.md` is the running record of this project's work: what is done, what is
+in progress, what is next, and any decision that is not obvious from the code.
+
+- **At the start of every session, read `docs/WORKLOG.md` before doing anything else**,
+  and resume from its "In progress" and "Next" sections. If a previous session was cut
+  off, that file is how you find out where it stopped.
+- **While working, keep it current.** When you start a piece of work, add it under
+  "In progress" with the files it touches. When it is done and verified (tsc, lint,
+  tests), move it to "Done" with the date. When you decide something the code cannot
+  explain — a policy choice, a rejected alternative, a Play-review constraint — write
+  it under "Decisions". Update it before ending a turn, not after.
+- Keep it short and factual. One line per item. It is a log, not a document; the
+  product thinking lives in `docs/PRODUCT_THESIS.md` and `docs/MARKET_AND_STRATEGY.md`,
+  the shipping checklist in `docs/RELEASE.md`, the gap history in `GAP_ANALYSIS.md`.
 ## Expo has changed — do not trust your training data
 Expo ships breaking changes every SDK release. APIs you remember are likely renamed, moved, or removed. Before writing any code that touches an Expo, EAS, or React Native API:
 1. Read the major version of the `expo` package in `package.json`.

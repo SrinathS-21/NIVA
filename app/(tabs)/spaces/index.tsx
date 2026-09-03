@@ -12,7 +12,6 @@ import {
   palette, accent, spaceAccent, hueAccent, withAlpha, SPACE_PALETTE,
   COLORS, FONT, RADIUS, SPACING, SCRIM,
 } from '../../../src/theme/tokens';
-import { MOCK_INSIGHTS, USE_MOCK_DATA } from '../../../src/data/mockData';
 import { spacePrimary, spaceStatus } from '../../../src/utils/spaceMetrics';
 import { useSpaceMetrics } from '../../../src/store/useSpaceMetrics';
 import { cardEnter } from '../../../src/theme/motion';
@@ -21,19 +20,22 @@ import { Plus, X, Trash2, ChevronDown } from 'lucide-react-native';
 import { CATEGORY_ICONS, FALLBACK_ICON } from '../../../src/components/ui/categoryIcons';
 import { HuePicker, HueSwatch } from '../../../src/components/ui/HuePicker';
 import { IconPicker } from '../../../src/components/ui/IconPicker';
-import type { Insight } from '../../../src/db/repositories/insights';
+import { MonthCard } from '../../../src/components/spaces/MonthCard';
+import { useWatchStore } from '../../../src/store/watchStore';
+import { parseRuleText, ruleToText, type SpaceRule } from '../../../src/core/spaces/SpaceRouter';
 import { reportInteraction } from '../../../src/store/activityStore';
-import { useTabReset } from '../../../src/store/tabResetContext';
+import { useTabResetHandler } from '../../../src/store/tabResetContext';
 
 const BUILT_IN_KEYS = ['finance', 'bill', 'delivery', 'travel', 'task'];
 
 function SpaceManagerModal({
   visible, onClose, isDark, mode, spaceKey, spaceLabel, spaceAccentIndex,
-  spaceAccentHue, spaceIcon, onCreated, onRenamed, onDeleted,
+  spaceAccentHue, spaceIcon, spaceRule, onCreated, onRenamed, onDeleted,
 }: {
   visible: boolean; onClose: () => void; isDark: boolean;
   mode: 'create' | 'rename'; spaceKey?: string; spaceLabel?: string;
   spaceAccentIndex?: number; spaceAccentHue?: number; spaceIcon?: string;
+  spaceRule?: SpaceRule | null;
   onCreated: (label: string) => void;
   onRenamed: (key: string, newLabel: string) => void;
   onDeleted: (key: string) => void;
@@ -54,6 +56,24 @@ function SpaceManagerModal({
    */
   const [pickedHue, setPickedHue] = useState<number | null>(spaceAccentHue ?? null);
   const [pickedIcon, setPickedIcon] = useState(spaceIcon ?? 'Tag');
+  /**
+   * What flows into this space. Two plain fields — words and senders — because
+   * that is what a person can write from memory and predict the effect of.
+   */
+  const initialRule = ruleToText(spaceRule);
+  const [ruleKeywords, setRuleKeywords] = useState(initialRule.keywords);
+  const [ruleSenders, setRuleSenders] = useState(initialRule.senders);
+  /**
+   * What Niva does when something lands here — the space's first watch.
+   *
+   * Routing ("what goes here") and handling ("what happens then") are two
+   * decisions, and a person making a space usually has both in mind. Offering
+   * the second at the moment of the first is what makes the two ideas feel
+   * like one: spaces are where things live, watches are what Niva does.
+   */
+  type Paired = 'none' | 'track' | 'remind' | 'ignore';
+  const [paired, setPaired] = useState<Paired>('none');
+  const addWatchWithTrigger = useWatchStore((st) => st.addWatchWithTrigger);
   const [showIcons, setShowIcons] = useState(false);
   // Open on a space that already has a custom colour, so editing one starts
   // where you left it rather than making you find the disc again.
@@ -75,6 +95,7 @@ function SpaceManagerModal({
   const recolorCategory = useCategoryStore((st) => st.recolorCategory);
   const recolorCategoryByHue = useCategoryStore((st) => st.recolorCategoryByHue);
   const reiconCategory = useCategoryStore((st) => st.reiconCategory);
+  const setCategoryRule = useCategoryStore((st) => st.setCategoryRule);
   const P = palette(isDark);
   const A = accent(isDark);
 
@@ -88,12 +109,23 @@ function SpaceManagerModal({
   const handleSubmit = async () => {
     if (!inputValue.trim()) return;
     if (mode === 'create') {
-      await addCategory(
+      const created = await addCategory(
         inputValue.trim(),
         pickedAccent,
         pickedHue ?? undefined,
         pickedIcon,
+        parseRuleText(ruleKeywords, ruleSenders),
       );
+      if (paired !== 'none') {
+        const verb = paired === 'track' ? 'Track' : paired === 'remind' ? 'Remind me about' : 'Ignore';
+        await addWatchWithTrigger(
+          `${verb} everything in ${created.label}`,
+          created.key,
+          paired,
+          { category: created.key },
+          'Created with the space',
+        ).catch(() => {});
+      }
       onCreated(inputValue.trim());
     } else if (spaceKey) {
       await renameCategory(spaceKey, inputValue.trim());
@@ -105,6 +137,12 @@ function SpaceManagerModal({
         await recolorCategory(spaceKey, pickedAccent);
       }
       if (pickedIcon !== spaceIcon) await reiconCategory(spaceKey, pickedIcon);
+      if (!isBuiltIn) {
+        const before = ruleToText(spaceRule);
+        if (ruleKeywords !== before.keywords || ruleSenders !== before.senders) {
+          await setCategoryRule(spaceKey, parseRuleText(ruleKeywords, ruleSenders));
+        }
+      }
       onRenamed(spaceKey, inputValue.trim());
     }
     setInputValue('');
@@ -313,6 +351,82 @@ function SpaceManagerModal({
             />
           )}
 
+          {/* ── What flows here ───────────────────────────────────────────
+              The part that makes a custom space a place rather than a label.
+              The engine only knows the five built-in domains; a space called
+              "Pets" receives nothing until it says what to look for. Built-ins
+              are fed by the engine and do not get this. */}
+          {(mode === 'create' || !isBuiltIn) && (
+            <>
+              <View style={styles.fieldRow}>
+                <Text style={[styles.fieldLabel, { color: P.inkMuted }]}>What flows here</Text>
+              </View>
+              <TextInput
+                style={[styles.modalInput, { backgroundColor: P.canvas, borderColor: P.stroke, color: P.ink }]}
+                placeholder="Words to look for · e.g. Swiggy, Zomato, food"
+                placeholderTextColor={P.inkDim}
+                value={ruleKeywords}
+                onChangeText={setRuleKeywords}
+                autoCapitalize="none"
+                returnKeyType="done"
+              />
+              <TextInput
+                style={[styles.modalInput, { backgroundColor: P.canvas, borderColor: P.stroke, color: P.ink }]}
+                placeholder="Senders · e.g. HDFCBK, Flipkart (optional)"
+                placeholderTextColor={P.inkDim}
+                value={ruleSenders}
+                onChangeText={setRuleSenders}
+                autoCapitalize="none"
+                returnKeyType="done"
+              />
+              <Text style={[styles.ruleHint, { color: P.inkDim }]}>
+                Any message mentioning one of these lands here instead of its built-in space. Leave both empty and this space stays a label.
+              </Text>
+            </>
+          )}
+
+          {mode === 'create' && (
+            <>
+              <View style={styles.fieldRow}>
+                <Text style={[styles.fieldLabel, { color: P.inkMuted }]}>When something lands here</Text>
+              </View>
+              <View style={styles.pairedRow}>
+                {(
+                  [
+                    { key: 'none', label: 'Just show it' },
+                    { key: 'track', label: 'Track it' },
+                    { key: 'remind', label: 'Remind me' },
+                    { key: 'ignore', label: 'Ignore it' },
+                  ] as { key: Paired; label: string }[]
+                ).map(({ key, label }) => {
+                  const on = paired === key;
+                  return (
+                    <TouchableOpacity
+                      key={key}
+                      onPress={() => setPaired(key)}
+                      activeOpacity={0.7}
+                      accessibilityRole="radio"
+                      accessibilityState={{ selected: on }}
+                      style={[styles.pairedPill, {
+                        backgroundColor: on ? A.brandSoft : P.canvas,
+                        borderColor: on ? A.brand : P.stroke,
+                      }]}
+                    >
+                      <Text style={[styles.pairedText, { color: on ? A.brand : P.inkMuted, fontFamily: on ? FONT.semibold : FONT.medium }]}>
+                        {label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+              {paired !== 'none' && (
+                <Text style={[styles.ruleHint, { color: P.inkDim }]}>
+                  Creates a watch on the Watch tab. You can pause or delete it there.
+                </Text>
+              )}
+            </>
+          )}
+
           <View style={styles.modalActions}>
             {mode === 'rename' && !isBuiltIn && (
               <TouchableOpacity style={styles.modalDeleteBtn} onPress={handleDelete} activeOpacity={0.7}>
@@ -344,17 +458,15 @@ export default function SpacesScreen() {
       accentIndex: number;
       accentHue?: number;
       icon: string;
+      rule?: SpaceRule | null;
     } | null
   >(null);
   const isDark = useThemeStore((st) => st.isDark);
-  const { consumeReset } = useTabReset();
   const router = useRouter();
 
   // Nothing to reset any more. The grid has no filter and no selection - the
   // thing this used to clear was the active pill, and there is no active pill.
-  useEffect(() => {
-    if (consumeReset('spaces')) setShowManager(false);
-  }, [consumeReset]);
+  useTabResetHandler('spaces', () => setShowManager(false));
 
   const categories = useCategoryStore((st) => st.categories);
   const loadCategories = useCategoryStore((st) => st.loadCategories);
@@ -368,10 +480,7 @@ export default function SpacesScreen() {
 
   useEffect(() => { loadCategories(); }, [loadCategories]);
 
-  const allInsights = useMemo(() => {
-    if (realInsights.length > 0) return realInsights;
-    return USE_MOCK_DATA ? (MOCK_INSIGHTS as unknown as Insight[]) : [];
-  }, [realInsights]);
+  const allInsights = realInsights;
 
   /**
    * How many things are waiting in each space, in one pass.
@@ -405,12 +514,13 @@ export default function SpacesScreen() {
     accentIndex: number,
     icon: string,
     accentHue?: number,
+    rule?: SpaceRule | null,
   ) => {
     // Built-ins included. A space's label, colour and glyph are presentation;
     // every insight keys off `category`, which never changes, so there is
     // nothing to protect by refusing.
     setManagerMode("rename");
-    setEditingSpace({ key, label, accentIndex, accentHue, icon });
+    setEditingSpace({ key, label, accentIndex, accentHue, icon, rule });
     setShowManager(true);
   };
 
@@ -424,8 +534,8 @@ export default function SpacesScreen() {
         title="Spaces"
         subtitle={
           pendingTotal > 0
-            ? `${categories.length} spaces \u00b7 ${pendingTotal} need attention`
-            : `${categories.length} spaces \u00b7 all clear`
+            ? `Where things live \u00b7 ${pendingTotal} need attention`
+            : `Where things live \u00b7 all clear`
         }
         titleAction={
           <TouchableOpacity onPress={handleOpenCreate}
@@ -453,13 +563,24 @@ export default function SpacesScreen() {
         contentContainerStyle={styles.grid}
         onScroll={reportInteraction}
         scrollEventThrottle={50}
+        ListHeaderComponent={
+          <MonthCard
+            isDark={isDark}
+            version={realInsights}
+            onPress={() => router.push('/spaces/month' as never)}
+          />
+        }
         renderItem={({ item }) => (
           <SpaceCard
             label={item.label}
             iconName={item.icon}
             tint={getAccent(item.key, isDark)}
             primary={spacePrimary(item.key, pendingByKey[item.key] ?? 0, metricsFor(item.key))}
-            status={spaceStatus(pendingByKey[item.key] ?? 0)}
+            status={
+              !item.isBuiltIn && !item.rule && (pendingByKey[item.key] ?? 0) === 0
+                ? 'Hold to set what flows here'
+                : spaceStatus(pendingByKey[item.key] ?? 0)
+            }
             pending={pendingByKey[item.key] ?? 0}
             isDark={isDark}
             onPress={() => router.push(`/spaces/${item.key}` as never)}
@@ -470,6 +591,7 @@ export default function SpacesScreen() {
                 item.accentIndex,
                 item.icon,
                 item.accentHue,
+                item.rule,
               )
             }
           />
@@ -491,6 +613,7 @@ export default function SpacesScreen() {
         // anyway - so the grid opens showing the truth rather than a suggestion
         // that has not been saved.
         spaceIcon={editingSpace?.icon ?? 'Tag'}
+        spaceRule={editingSpace?.rule}
         onCreated={handleSpaceCreated}
         onRenamed={handleSpaceRenamed} onDeleted={handleSpaceDeleted} />
     </SafeAreaView>
@@ -654,6 +777,15 @@ const styles = StyleSheet.create({
   discloseText: {
     fontFamily: FONT.semibold, fontSize: 12, lineHeight: 16,
   },
+  ruleHint: {
+    fontFamily: FONT.regular, fontSize: 11, lineHeight: 15,
+  },
+  pairedRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  pairedPill: {
+    paddingHorizontal: SPACING.md, paddingVertical: 6,
+    borderRadius: RADIUS.pill, borderWidth: StyleSheet.hairlineWidth,
+  },
+  pairedText: { fontSize: 12, lineHeight: 16 },
   disclosePanel: {
     padding: SPACING.md,
     borderRadius: RADIUS.md,

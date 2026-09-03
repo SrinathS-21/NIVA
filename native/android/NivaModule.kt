@@ -2,6 +2,7 @@ package com.nivaapp.niva
 
 import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import androidx.core.app.NotificationManagerCompat
@@ -31,6 +32,27 @@ class NivaModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
     }
 
     override fun getName() = "NivaModule"
+
+    /**
+     * Which build this is.
+     *
+     * The config plugin writes `smsCapture` into the manifest as meta-data.
+     * Reading it back here is what lets the settings screen hide the SMS
+     * switch on a store build — a switch with nothing behind it would read
+     * as broken, not as absent.
+     */
+    override fun getConstants(): MutableMap<String, Any> {
+        val smsCaptureAvailable = try {
+            val info = reactApplicationContext.packageManager.getApplicationInfo(
+                reactApplicationContext.packageName,
+                PackageManager.GET_META_DATA,
+            )
+            info.metaData?.getBoolean("com.nivaapp.niva.SMS_CAPTURE", false) ?: false
+        } catch (e: Throwable) {
+            false
+        }
+        return mutableMapOf("smsCaptureAvailable" to smsCaptureAvailable)
+    }
 
     // ── Notification access ──────────────────────────────────────────────────
 

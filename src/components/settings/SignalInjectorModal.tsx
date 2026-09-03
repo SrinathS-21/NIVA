@@ -19,8 +19,9 @@ import { palette, accent, categoryAccent, FONT, TYPE, RADIUS, SPACING, SCRIM } f
 import { sheetEnter, DURATION } from '../../theme/motion';
 import { injectSignal } from '../../core/IngestionService';
 import type { PipelineResult } from '../../core/SignalPipeline';
+import { SAMPLE_SIGNALS, type SampleSignal } from '../../data/sampleSignals';
 import {
-  CreditCard, CalendarDays, Truck, MessageSquare, FileText,
+  CreditCard, CalendarDays, Truck, MessageSquare, Banknote, ListChecks,
   Zap, Send,
 } from 'lucide-react-native';
 
@@ -35,91 +36,20 @@ interface SignalInjectorModalProps {
 }
 
 /**
- * A preset is a *message*, not an insight.
- *
- * This is the whole point of the rewrite. The presets used to be finished
- * objects — `{ entity: 'HDFC Credit Card', amount: 8420, … }` — handed to an
- * `onInject` callback that `console.log`ed them. Nothing was normalized,
- * nothing was classified, nothing was validated, nothing was stored. The one
- * tool for testing the pipeline was the one thing in the app that bypassed it
- * entirely.
- *
- * These are raw message bodies, phrased the way the real senders phrase them,
- * and they go in at the same door a real SMS does.
+ * The presets are the shared samples in data/sampleSignals — the same
+ * messages the inbox offers a new install. One fixture, two doors, so the
+ * demo and the developer tool can never drift apart.
  */
-const PRESETS: {
-  id: string;
-  category: string;
-  label: string;
-  icon: typeof CreditCard;
-  source: 'sms' | 'notification';
-  sender: string;
-  text: string;
-}[] = [
-  {
-    id: 'hdfc-bill',
-    category: 'bill',
-    label: 'Credit card bill due',
-    icon: CreditCard,
-    source: 'sms',
-    sender: 'HDFCBK',
-    text: 'Your HDFC Bank Credit Card XX4821 statement is generated. Total due Rs.8,420.00, minimum due Rs.420.00. Payment due date 24-08. Pay now to avoid late fees.',
-  },
-  {
-    id: 'airtel',
-    category: 'bill',
-    label: 'Postpaid bill',
-    icon: FileText,
-    source: 'sms',
-    sender: 'AIRTEL',
-    text: 'Dear Customer, your Airtel postpaid bill of Rs 799 for 9876543210 is due on 02-09. Autopay is not active on this number.',
-  },
-  {
-    id: 'upi-debit',
-    category: 'finance',
-    label: 'UPI debit',
-    icon: CreditCard,
-    source: 'sms',
-    sender: 'ICICIB',
-    text: 'Dear Customer, Acct XX8842 is debited with INR 1,240.00 on 21-Aug. UPI Ref 523119904412. Info: SWIGGY. Available bal INR 42,180.55.',
-  },
-  {
-    id: 'flipkart',
-    category: 'delivery',
-    label: 'Out for delivery',
-    icon: Truck,
-    source: 'notification',
-    sender: 'Flipkart',
-    text: 'Your order of boAt Airdopes 141 is out for delivery today and will arrive by 7 PM. Tracking ID FMPP1234567890 via Bluedart.',
-  },
-  {
-    id: 'indigo',
-    category: 'travel',
-    label: 'Flight booked',
-    icon: CalendarDays,
-    source: 'sms',
-    sender: 'INDIGO',
-    text: 'Booking confirmed. 6E 2043 BLR to DEL on 09 Sep, departs 06:15, arrives 09:00. PNR K4X9TQ. Web check-in opens 48 hours before departure.',
-  },
-  {
-    id: 'interview',
-    category: 'task',
-    label: 'Appointment reminder',
-    icon: MessageSquare,
-    source: 'notification',
-    sender: 'Google Calendar',
-    text: 'Reminder: Interview - TCS Round 2 tomorrow at 3:00 PM. Google Meet link is in the invite.',
-  },
-  {
-    id: 'promo',
-    category: 'noise',
-    label: 'Promotional (should be filtered)',
-    icon: Zap,
-    source: 'sms',
-    sender: 'MYNTRA',
-    text: 'FLASH SALE! Flat 70% off on everything. Limited time offer, hurry! Click here to claim your exclusive coupon. Reply STOP to opt out.',
-  },
-];
+const ICON_FOR: Record<SampleSignal['category'], typeof CreditCard> = {
+  bill: CreditCard,
+  finance: Banknote,
+  delivery: Truck,
+  travel: CalendarDays,
+  task: ListChecks,
+  noise: Zap,
+};
+
+const PRESETS = SAMPLE_SIGNALS.map((s) => ({ ...s, icon: ICON_FOR[s.category] ?? MessageSquare }));
 
 /** What each pipeline outcome should say to someone testing it. */
 function describeResult(result: PipelineResult): { text: string; tone: 'good' | 'neutral' | 'bad' } {
@@ -136,6 +66,11 @@ function describeResult(result: PipelineResult): { text: string; tone: 'good' | 
       return { text: 'Already captured — deduped', tone: 'neutral' };
     case 'model_not_ready':
       return { text: 'Engine not ready yet — queued for replay', tone: 'bad' };
+    // Reachable whenever the engine throws or reports a failed completion. It
+    // used to fall through to "Unknown outcome", which is the least useful
+    // thing to read on the one screen every bug report is meant to quote.
+    case 'classification_failed':
+      return { text: 'Engine failed to read it — left pending, retried on next open', tone: 'bad' };
     case 'validation_failed':
       return { text: `Rejected: ${result.reason}`, tone: 'bad' };
     default:
@@ -320,8 +255,8 @@ function PresetRow({
       style={[styles.presetRow, { borderColor: P.stroke }, animatedStyle]}
       onPress={onPress}
       disabled={isRunning}
-      onPressIn={() => { scale.value = withTiming(0.97, { duration: 60 }); }}
-      onPressOut={() => { scale.value = withTiming(1.0, { duration: 80 }); }}
+      onPressIn={() => { scale.set(withTiming(0.97, { duration: 60 })); }}
+      onPressOut={() => { scale.set(withTiming(1.0, { duration: 80 })); }}
       activeOpacity={0.8}
     >
       <View style={[styles.presetIcon, { backgroundColor: tint.soft }]}>

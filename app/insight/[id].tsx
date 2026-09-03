@@ -19,14 +19,14 @@ import { useInboxStore } from '../../src/store/inboxStore';
 import { getInsightById } from '../../src/db/repositories/insights';
 import { getActionsForInsight, type Action } from '../../src/db/repositories/actions';
 import { getSignalById } from '../../src/db/repositories/signals';
-import { MOCK_INSIGHTS, USE_MOCK_DATA } from '../../src/data/mockData';
 import { timeAgo } from '../../src/utils/helpers';
 import { palette, accent, COLORS, FONT, RADIUS, SPACING } from '../../src/theme/tokens';
 import { useCategoryStore } from '../../src/store/categoryStore';
 import { SheetModal } from '../../src/components/ui/SheetModal';
+import { addInsightToCalendar } from '../../src/core/calendar/CalendarBridge';
 import { screenEnter, cardEnter } from '../../src/theme/motion';
 import type { Insight } from '../../src/db/repositories/insights';
-import { ChevronLeft, ChevronRight, Check } from 'lucide-react-native';
+import { ChevronLeft, ChevronRight, Check, Share2 } from 'lucide-react-native';
 
 const AnimatedTouchable = Animated.createAnimatedComponent(TouchableOpacity);
 
@@ -48,8 +48,8 @@ function AnimatedButton({
     <AnimatedTouchable
       style={[style, animatedStyle]}
       onPress={onPress}
-      onPressIn={() => { scale.value = withTiming(0.97, { duration: 60 }); }}
-      onPressOut={() => { scale.value = withTiming(1.0, { duration: 80 }); }}
+      onPressIn={() => { scale.set(withTiming(0.97, { duration: 60 })); }}
+      onPressOut={() => { scale.set(withTiming(1.0, { duration: 80 })); }}
       activeOpacity={0.8}
     >
       {children}
@@ -61,11 +61,12 @@ export default function InsightDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const { isDark } = useThemeStore();
-  const { trackInsight, remindInsight, calendarInsight, dismissInsight, restoreInsight } =
+  const { trackInsight, remindInsight, calendarInsight, dismissInsight, restoreInsight, shareInsight } =
     useInboxStore();
   const { getAccent } = useCategoryStore();
   const [insight, setInsight] = useState<Insight | null>(null);
   const [rawText, setRawText] = useState<string | null>(null);
+  const [sourceKind, setSourceKind] = useState<'SMS' | 'Notification'>('Notification');
   const [history, setHistory] = useState<Action[]>([]);
   /**
    * Explicit, rather than inferred from `insight === null`.
@@ -75,30 +76,22 @@ export default function InsightDetailScreen() {
    * never in SQLite. Tapping a card on the seeded inbox took you to a dead
    * screen, which is the first thing anyone reviewing the app would try.
    */
-  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'missing'>('loading');
+  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'missing'>(
+    id ? 'loading' : 'missing',
+  );
   const [showSourceSheet, setShowSourceSheet] = useState(false);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const P = palette(isDark);
   const A = accent(isDark);
 
   useEffect(() => {
-    if (!id) {
-      setLoadState('missing');
-      return;
-    }
+    // No id means `loadState` was seeded as 'missing' above; nothing to load.
+    if (!id) return;
     let cancelled = false;
 
     (async () => {
       const row = await getInsightById(id);
-
-      // Demo content is not in the database. Falling back to it keeps the
-      // seeded inbox navigable while `USE_MOCK_DATA` is on, and costs nothing
-      // once it is off.
-      const fallback = USE_MOCK_DATA
-        ? ((MOCK_INSIGHTS as unknown as Insight[]).find((i) => i.id === id) ?? null)
-        : null;
-
-      const found = row ?? fallback;
+      const found = row;
       if (cancelled) return;
 
       if (!found) {
@@ -116,6 +109,7 @@ export default function InsightDetailScreen() {
         ]);
         if (cancelled) return;
         setRawText(signal?.raw_text ?? null);
+        setSourceKind(signal?.source === 'sms' ? 'SMS' : 'Notification');
         setHistory(actions);
       }
     })();
@@ -186,13 +180,13 @@ export default function InsightDetailScreen() {
   const TRACK: ActionSpec = { label: 'Track', run: () => trackInsight(insight.id), done: 'Tracked' };
   const REMIND = (label: string): ActionSpec => ({
     label,
-    run: () => remindInsight(insight.id),
+    run: () => { remindInsight(insight.id).catch(() => {}); },
     done: 'Reminder set',
   });
   const CALENDAR: ActionSpec = {
     label: 'Add to Calendar',
-    run: () => calendarInsight(insight.id),
-    done: 'Added to calendar',
+    run: () => { calendarInsight(insight.id).catch(() => {}); },
+    done: 'Opening your calendar',
   };
 
   const actions: { primary: ActionSpec; secondary: ActionSpec | null } = (() => {
@@ -214,11 +208,27 @@ export default function InsightDetailScreen() {
   const ACTION_LABELS: Record<Action['action_type'], string> = {
     track: 'Tracked',
     remind: 'Reminder set',
-    calendar: 'Added to calendar',
+    calendar: 'Opened in calendar',
     ignore: 'Ignored',
+    paid: 'Paid',
+    share: 'Sent to another app',
   };
 
   const isResolved = insight.status !== 'inbox';
+
+  /**
+   * A watch cannot open the calendar app on someone's behalf — that dialog
+   * is the confirmation step — so a "calendar" rule sets a reminder and
+   * leaves the actual calendar step for here.
+   */
+  const calendarDeferred = history.some((entry) => {
+    try {
+      const payload = entry.payload_json ? JSON.parse(entry.payload_json) : null;
+      return payload?.calendar === 'deferred';
+    } catch {
+      return false;
+    }
+  });
 
   return (
     <SafeAreaView style={[styles.screen, { backgroundColor: P.canvas }]} edges={['top']}>
@@ -266,7 +276,7 @@ export default function InsightDetailScreen() {
               <View style={{ flex: 1 }}>
                 <Text style={[styles.sourceLabel, { color: P.inkDim }]}>Source</Text>
                 <Text style={[styles.sourceTitle, { color: P.ink }]}>
-                  From {String(entities.entity ?? 'Unknown')} · Notification
+                  From {String(entities.entity ?? 'Unknown')} · {sourceKind}
                 </Text>
                 <Text style={[styles.sourceMeta, { color: P.inkMuted }]}>
                   {dateStr} · {timeStr}
@@ -300,9 +310,11 @@ export default function InsightDetailScreen() {
                 {history.length > 0 ? (
                   history.map((entry, idx) => {
                     let viaWatch: string | null = null;
+                    let viaNiva = false;
                     try {
                       const payload = entry.payload_json ? JSON.parse(entry.payload_json) : null;
                       if (payload?.via === 'watch') viaWatch = String(payload.watch_title ?? 'a watch');
+                      if (payload?.via === 'niva') viaNiva = true;
                     } catch {
                       // A payload we cannot read just means no attribution line.
                     }
@@ -320,7 +332,11 @@ export default function InsightDetailScreen() {
                             {ACTION_LABELS[entry.action_type]}
                           </Text>
                           <Text style={[styles.historyMeta, { color: P.inkMuted }]}>
-                            {viaWatch ? `Automatically, by "${viaWatch}"` : 'By you'} ·{' '}
+                            {viaWatch
+                              ? `Automatically, by "${viaWatch}"`
+                              : viaNiva
+                                ? 'Automatically, by Niva — a matching payment arrived'
+                                : 'By you'} ·{' '}
                             {timeAgo(entry.executed_at)}
                           </Text>
                         </View>
@@ -336,6 +352,15 @@ export default function InsightDetailScreen() {
                   </View>
                 )}
               </View>
+
+              {calendarDeferred && (
+                <AnimatedButton
+                  style={[styles.primaryBtn, { backgroundColor: A.brand, marginTop: 12 }]}
+                  onPress={() => { addInsightToCalendar(insight).catch(() => {}); }}
+                >
+                  <Text style={styles.primaryBtnText}>Add to Calendar</Text>
+                </AnimatedButton>
+              )}
 
               <AnimatedButton
                 style={[styles.secondaryBtn, { backgroundColor: P.surfaceHighlight, borderColor: P.stroke, marginTop: 12 }]}
@@ -378,6 +403,25 @@ export default function InsightDetailScreen() {
               </TouchableOpacity>
             </>
           )}
+
+          {/* ── Send to… ────────────────────────────────────────────────
+              The universal connected tool. A task to Google Tasks, a bill to
+              a spouse on WhatsApp, a booking to a colleague — the share sheet
+              already knows every app on the phone, and nothing has to be
+              authorised. It never resolves the card: sending a bill to
+              someone does not pay it. */}
+          {!actionFeedback && (
+            <TouchableOpacity
+              style={[styles.shareBtn, { borderColor: P.stroke }]}
+              onPress={() => { shareInsight(insight.id).catch(() => {}); }}
+              activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel="Send to another app"
+            >
+              <Share2 size={15} color={P.inkSecondary} strokeWidth={2} />
+              <Text style={[styles.shareBtnText, { color: P.inkSecondary }]}>Send to…</Text>
+            </TouchableOpacity>
+          )}
         </Animated.View>
       </ScrollView>
 
@@ -390,7 +434,7 @@ export default function InsightDetailScreen() {
         <Text style={[styles.sheetTitle, { color: P.ink }]}>Why am I seeing this?</Text>
 
         <Text style={[styles.sheetBody, { color: P.inkSecondary }]}>
-          Niva found this in a notification from {String(entities.entity ?? 'Unknown')}.
+          Niva found this in {sourceKind === 'SMS' ? 'an SMS' : 'a notification'} from {String(entities.entity ?? 'Unknown')}.
         </Text>
 
         {rawText && (
@@ -612,6 +656,21 @@ const styles = StyleSheet.create({
     fontFamily: FONT.regular,
     fontSize: 13,
     lineHeight: 18,
+  },
+  shareBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: SPACING.xs,
+    paddingVertical: SPACING.md,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    marginTop: SPACING.sm,
+  },
+  shareBtnText: {
+    fontFamily: FONT.semibold,
+    fontSize: 14,
+    lineHeight: 19,
   },
 
   // ── Feedback ────────────────────────────────────────────────────────────

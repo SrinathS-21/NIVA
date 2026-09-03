@@ -19,8 +19,11 @@ interface Props {
  * Expanded:  all model rows listed with download / active indicators.
  */
 export function EngineSelector({ isDark, expanded, onToggle, onSelect }: Props) {
-  const { activeModelId, pendingModelId, status, progress, downloadedIds, selectModel } =
-    useModelStore();
+  const {
+    activeModelId, pendingModelId, status, progress, downloadedIds, selectModel,
+    allowMobileData, lastError,
+  } = useModelStore();
+  const waitingForWifi = status === 'waiting_wifi';
   const P = palette(isDark);
   const A = accent(isDark);
   const brand = A.brand;
@@ -47,7 +50,13 @@ export function EngineSelector({ isDark, expanded, onToggle, onSelect }: Props) 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14, flex: 1 }}>
           <View style={{ flex: 1 }}>
             <Text style={[styles.name, { color: P.ink }]}>{activeModel.name}</Text>
-            <Text style={[styles.tagline, { color: P.inkMuted }]}>{activeModel.tagline}</Text>
+            <Text style={[styles.tagline, { color: P.inkMuted }]}>
+              {waitingForWifi
+                ? `Waiting for Wi-Fi to download · ${formatSize(activeModel.sizeMb)}`
+                : status === 'error' && lastError
+                  ? 'Could not download — tap to retry'
+                  : activeModel.tagline}
+            </Text>
           </View>
         </View>
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
@@ -77,6 +86,25 @@ export function EngineSelector({ isDark, expanded, onToggle, onSelect }: Props) 
       </TouchableOpacity>
 
       <View style={[styles.divider, { backgroundColor: P.stroke }]} />
+
+      {/* The one honest thing to say while the engine is held back: why, and
+          the way past it. Buried in a footnote nobody would find it. */}
+      {waitingForWifi && (
+        <>
+          <TouchableOpacity style={styles.row} activeOpacity={0.7} onPress={() => allowMobileData().catch(console.error)}>
+            <View style={styles.rowMain}>
+              <Text style={[styles.name, { color: P.ink }]}>Waiting for Wi-Fi</Text>
+              <Text style={[styles.tagline, { color: P.inkMuted }]}>
+                The engine downloads once, on Wi-Fi by default. Tap to download on mobile data instead.
+              </Text>
+            </View>
+            <View style={styles.rowRight}>
+              <Download size={16} color={brand} strokeWidth={1.75} />
+            </View>
+          </TouchableOpacity>
+          <View style={[styles.divider, { backgroundColor: P.stroke }]} />
+        </>
+      )}
 
       {NIVA_MODELS.map((model, idx) => {
         const isActive = model.id === activeModelId;

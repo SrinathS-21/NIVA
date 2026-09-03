@@ -3,9 +3,40 @@ import { getDb } from '../schema';
 export interface Action {
   id: string;
   insight_id: string;
-  action_type: 'track' | 'remind' | 'calendar' | 'ignore';
+  /**
+   * `paid` is written by the reconciler when a debit matches a pending bill;
+   * `share` when an insight is handed to another app through the share sheet.
+   */
+  action_type: 'track' | 'remind' | 'calendar' | 'ignore' | 'paid' | 'share';
   payload_json: string | null;
   executed_at: number;
+}
+
+/** An action with the insight it was taken on — what the policy learner reads. */
+export interface ActionWithInsight extends Action {
+  category: string;
+  title: string;
+  entities_json: string;
+}
+
+/**
+ * What the person has done, by hand, lately.
+ *
+ * Only `via: "user"` rows: a watch's own actions are already automated and
+ * must not be counted as evidence that the user wants more automation.
+ */
+export async function getUserActionHistory(limit = 300): Promise<ActionWithInsight[]> {
+  const db = await getDb();
+  return db.getAllAsync<ActionWithInsight>(
+    `SELECT a.id, a.insight_id, a.action_type, a.payload_json, a.executed_at,
+            i.category, i.title, i.entities_json
+       FROM actions a
+       JOIN insights i ON i.id = a.insight_id
+      WHERE a.payload_json LIKE '%"via":"user"%'
+      ORDER BY a.executed_at DESC
+      LIMIT ?`,
+    [limit],
+  );
 }
 
 export async function insertAction(action: Action): Promise<void> {

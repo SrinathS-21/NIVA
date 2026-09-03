@@ -13,7 +13,6 @@ import {
   FALLBACK_ICON,
 } from '../../../src/components/ui/categoryIcons';
 import { palette, FONT, RADIUS, SPACING, TYPE } from '../../../src/theme/tokens';
-import { MOCK_INSIGHTS, USE_MOCK_DATA } from '../../../src/data/mockData';
 import { spacePrimary, spaceSummary } from '../../../src/utils/spaceMetrics';
 import { useSpaceMetrics } from '../../../src/store/useSpaceMetrics';
 import { cardEnter } from '../../../src/theme/motion';
@@ -59,14 +58,9 @@ export default function SpaceDetailScreen() {
   const tint = getAccent(key ?? '', isDark);
   const Icon = CATEGORY_ICONS[space?.icon ?? 'Tag'] ?? FALLBACK_ICON;
 
-  const allInsights = useMemo(() => {
-    if (realInsights.length > 0) return realInsights;
-    return USE_MOCK_DATA ? (MOCK_INSIGHTS as unknown as Insight[]) : [];
-  }, [realInsights]);
-
   const items = useMemo(
-    () => allInsights.filter((i) => i.category === key && i.status === 'inbox'),
-    [allInsights, key],
+    () => realInsights.filter((i) => i.category === key && i.status === 'inbox'),
+    [realInsights, key],
   );
 
   const renderItem = useCallback(

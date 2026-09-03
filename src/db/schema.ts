@@ -1,16 +1,58 @@
 import * as SQLite from 'expo-sqlite';
 
 let db: SQLite.SQLiteDatabase | null = null;
+let opening: Promise<SQLite.SQLiteDatabase> | null = null;
 
 export async function getDb(): Promise<SQLite.SQLiteDatabase> {
-  if (!db) {
-    db = await SQLite.openDatabaseAsync('niva.db');
-    await initSchema(db);
+  if (db) return db;
+
+  // Concurrent callers share one open. Several stores call `getDb()` on the
+  // same frame at startup; without this they each open a handle and each run
+  // the migrations, which is how two `ALTER TABLE`s race into a duplicate
+  // column error on a cold start.
+  if (!opening) {
+    opening = (async () => {
+      const handle = await SQLite.openDatabaseAsync('niva.db');
+      try {
+        await initSchema(handle);
+      } catch (e) {
+        // Do not cache a half-initialised database. Caching it means every
+        // later read hits a schema that failed to migrate, and the one real
+        // error is buried under a hundred confusing ones.
+        await handle.closeAsync().catch(() => {});
+        throw e;
+      }
+      db = handle;
+      return handle;
+    })().finally(() => {
+      opening = null;
+    });
   }
-  return db;
+
+  return opening;
 }
 
+/**
+ * Bring the database up to the current shape.
+ *
+ * The three phases below are ordered deliberately and must stay that way:
+ *
+ *   1. `CREATE TABLE IF NOT EXISTS` — creates tables on a fresh install and
+ *      does *nothing at all* on an existing one, including for columns added
+ *      to the statement since that install.
+ *   2. Migrations — `ALTER TABLE` for every column added after v1, guarded by
+ *      `PRAGMA table_info`.
+ *   3. `CREATE INDEX IF NOT EXISTS` — last, because an index naming a column
+ *      from phase 2 cannot be created before phase 2 has added it.
+ *
+ * Putting an index in phase 1 is what produced `no such column: dedupe_key` on
+ * every upgraded install: the table already existed so it was not recreated
+ * with the new column, and the index in the same batch referenced a column
+ * that phase 2 had not reached yet. `execAsync` runs the batch as a unit, so
+ * that one statement failed the whole of schema init.
+ */
 async function initSchema(db: SQLite.SQLiteDatabase): Promise<void> {
+  // ── 1. Tables ───────────────────────────────────────────────────────────
   await db.execAsync(`
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
@@ -70,6 +112,17 @@ async function initSchema(db: SQLite.SQLiteDatabase): Promise<void> {
       handled_count INTEGER NOT NULL DEFAULT 0
     );
 
+    -- Spaces the user made. Built-ins are not rows here — they are code —
+    -- so this table is exactly the set of spaces that would be lost without
+    -- it. rule_json is how a custom space claims insights; see
+    -- core/spaces/SpaceRouter. A space with no rule is a label only.
+    CREATE TABLE IF NOT EXISTS custom_categories (
+      key        TEXT PRIMARY KEY,
+      label      TEXT NOT NULL,
+      rule_json  TEXT,
+      created_at INTEGER NOT NULL
+    );
+
     -- Per-space overrides. Keyed by category key so a built-in and a
     -- user-created space are recoloured and renamed through the same path.
     -- A row exists only once the user has changed something.
@@ -90,7 +143,23 @@ async function initSchema(db: SQLite.SQLiteDatabase): Promise<void> {
       icon         TEXT,
       updated_at   INTEGER NOT NULL
     );
+  `);
 
+  // ── 2. Migrations ───────────────────────────────────────────────────────
+  // `CREATE TABLE IF NOT EXISTS` above does nothing on a database that already
+  // has the table, so a column added later has to be migrated in separately or
+  // every existing install crashes on the first read that mentions it.
+  await addColumnIfMissing(db, 'insights', 'actioned_at', 'INTEGER');
+  await addColumnIfMissing(db, 'category_prefs', 'accent_hue', 'INTEGER');
+  await addColumnIfMissing(db, 'category_prefs', 'icon', 'TEXT');
+  // The one that crashed every upgraded install when it was missing. Guarded
+  // by src/__tests__/schema.test.ts, which migrates a pre-dedupe database.
+  await addColumnIfMissing(db, 'signals', 'dedupe_key', 'TEXT');
+  await addColumnIfMissing(db, 'custom_categories', 'rule_json', 'TEXT');
+
+  // ── 3. Indexes ──────────────────────────────────────────────────────────
+  // Last, so that an index over a phase-2 column always finds it.
+  await db.execAsync(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_dedupe ON signals(dedupe_key)
       WHERE dedupe_key IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_signals_status     ON signals(status);
@@ -101,41 +170,22 @@ async function initSchema(db: SQLite.SQLiteDatabase): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_actions_insight_id ON actions(insight_id);
     CREATE INDEX IF NOT EXISTS idx_watches_enabled    ON watches(enabled);
   `);
+}
 
-  // ── Migrations ──────────────────────────────────────────────────────────
-  // Add actioned_at column if missing (for existing databases)
-  const insightCols = await db.getAllAsync<{ name: string }>(
-    `PRAGMA table_info(insights)`
-  );
-  const hasActionedAt = insightCols.some((c) => c.name === 'actioned_at');
-  if (!hasActionedAt) {
-    await db.runAsync(`ALTER TABLE insights ADD COLUMN actioned_at INTEGER`);
-  }
-
-  // `CREATE TABLE IF NOT EXISTS` above does nothing on a database that already
-  // has the table, so a column added later has to be migrated in separately or
-  // every existing install crashes on the first read that mentions it.
-  const prefCols = await db.getAllAsync<{ name: string }>(
-    `PRAGMA table_info(category_prefs)`
-  );
-  if (!prefCols.some((c) => c.name === 'accent_hue')) {
-    await db.runAsync(`ALTER TABLE category_prefs ADD COLUMN accent_hue INTEGER`);
-  }
-  if (!prefCols.some((c) => c.name === 'icon')) {
-    await db.runAsync(`ALTER TABLE category_prefs ADD COLUMN icon TEXT`);
-  }
-
-  // Same story for `signals.dedupe_key`. The unique index has to be created
-  // after the column exists, so it is repeated here rather than left to the
-  // `CREATE TABLE` block above, which no-ops on an existing database.
-  const signalCols = await db.getAllAsync<{ name: string }>(
-    `PRAGMA table_info(signals)`
-  );
-  if (!signalCols.some((c) => c.name === 'dedupe_key')) {
-    await db.runAsync(`ALTER TABLE signals ADD COLUMN dedupe_key TEXT`);
-    await db.execAsync(
-      `CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_dedupe ON signals(dedupe_key)
-         WHERE dedupe_key IS NOT NULL;`
-    );
-  }
+/**
+ * `ALTER TABLE ... ADD COLUMN`, but only when the column is genuinely absent.
+ *
+ * SQLite has no `ADD COLUMN IF NOT EXISTS`, and re-adding one is an error that
+ * aborts the whole of schema init — so every post-v1 column goes through here
+ * rather than through a hand-written `PRAGMA` check per site.
+ */
+async function addColumnIfMissing(
+  db: SQLite.SQLiteDatabase,
+  table: string,
+  column: string,
+  type: string,
+): Promise<void> {
+  const cols = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+  if (cols.some((c) => c.name === column)) return;
+  await db.runAsync(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
 }

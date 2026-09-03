@@ -1,5 +1,13 @@
 import { create } from 'zustand';
 import { getDb } from '../db/schema';
+import {
+  deleteCustomSpace,
+  getCustomSpaces,
+  insertCustomSpace,
+  renameCustomSpace,
+  setCustomSpaceRule,
+} from '../db/repositories/spaces';
+import { parseRuleJson, type SpaceRule } from '../core/spaces/SpaceRouter';
 import { spaceAccent, hueAccent, DEFAULT_SPACE_ACCENT, SPACE_PALETTE } from '../theme/tokens';
 
 // ── Spaces ───────────────────────────────────────────────────────────────────
@@ -30,6 +38,12 @@ export interface Category {
    * into something legible on the ground it lands on.
    */
   accentHue?: number;
+  /**
+   * How this space claims insights. Custom spaces only — the built-ins are
+   * fed by the model. A custom space with no rule is a label the pipeline
+   * can never reach; the space editor says so.
+   */
+  rule?: SpaceRule | null;
 }
 
 const BUILT_INS: Omit<Category, 'accentIndex'>[] = [
@@ -58,6 +72,14 @@ function defaults(): Category[] {
  * the label stays exactly what was typed, so a user who wants two spaces both
  * called Task can have them.
  */
+/**
+ * Route names under `app/(tabs)/spaces/`. A space's key becomes a URL segment
+ * (`/spaces/<key>`), and Expo Router gives a static file precedence over the
+ * `[key]` route — so a space called "Month" would slug to `month` and open the
+ * month screen instead of itself. Reserved, the same way the built-in keys are.
+ */
+const RESERVED_KEYS = ['month', 'index', '_layout'];
+
 function slugify(label: string, taken: Set<string>): string {
   const base =
     label
@@ -69,10 +91,10 @@ function slugify(label: string, taken: Set<string>): string {
     // An empty key is still a key, and two of them would collide again.
     'space';
 
-  if (!taken.has(base)) return base;
+  if (!taken.has(base) && !RESERVED_KEYS.includes(base)) return base;
   for (let n = 2; n < 1000; n++) {
     const candidate = `${base}_${n}`;
-    if (!taken.has(candidate)) return candidate;
+    if (!taken.has(candidate) && !RESERVED_KEYS.includes(candidate)) return candidate;
   }
   return `${base}_${Date.now()}`;
 }
@@ -95,6 +117,7 @@ interface CategoryState {
     accentIndex?: number,
     accentHue?: number,
     icon?: string,
+    rule?: SpaceRule | null,
   ) => Promise<Category>;
   renameCategory: (key: string, newLabel: string) => Promise<void>;
   /** Move a space to a `SPACE_PALETTE` slot, clearing any custom hue. */
@@ -103,6 +126,8 @@ interface CategoryState {
   recolorCategoryByHue: (key: string, hue: number) => Promise<void>;
   /** Give a space a different glyph. `icon` is a key of `CATEGORY_ICONS`. */
   reiconCategory: (key: string, icon: string) => Promise<void>;
+  /** Change what a custom space claims. `null` turns routing off. */
+  setCategoryRule: (key: string, rule: SpaceRule | null) => Promise<void>;
   removeCategory: (key: string) => Promise<void>;
   getAccent: (
     key: string,
@@ -182,10 +207,7 @@ let inFlight: Promise<void> | null = null;
 async function refresh(set: (partial: Partial<CategoryState>) => void): Promise<void> {
   set({ isLoading: true });
   try {
-    const db = await getDb();
-    const rows = await db.getAllAsync<{ key: string; label: string; created_at: number }>(
-      `SELECT key, label, created_at FROM custom_categories ORDER BY created_at ASC`,
-    );
+    const rows = await getCustomSpaces();
     const prefs = await readPrefs();
 
     // Custom spaces start at the slot after the built-ins and wrap, so the
@@ -197,6 +219,7 @@ async function refresh(set: (partial: Partial<CategoryState>) => void): Promise<
       icon: 'Tag',
       isBuiltIn: false,
       accentIndex: (firstFree + idx) % SPACE_PALETTE.length,
+      rule: parseRuleJson(row.rule_json),
     }));
 
     /**
@@ -252,21 +275,11 @@ export const useCategoryStore = create<CategoryState>((set, get) => ({
     accentIndex?: number,
     accentHue?: number,
     icon?: string,
+    rule?: SpaceRule | null,
   ) => {
     const key = slugify(label, new Set(get().categories.map((c) => c.key)));
-    const db = await getDb();
 
-    await db.runAsync(
-      `CREATE TABLE IF NOT EXISTS custom_categories (
-        key TEXT PRIMARY KEY,
-        label TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      )`,
-    );
-    await db.runAsync(
-      `INSERT OR IGNORE INTO custom_categories (key, label, created_at) VALUES (?, ?, ?)`,
-      [key, label, Date.now()],
-    );
+    await insertCustomSpace(key, label, rule ?? null);
 
     // Written before the read, not after, so the space appears in its chosen
     // colour on the first render it ever has. Setting it afterwards would show
@@ -292,6 +305,7 @@ export const useCategoryStore = create<CategoryState>((set, get) => ({
         icon: 'Tag',
         isBuiltIn: false,
         accentIndex: 0,
+        rule: rule ?? null,
       }
     );
   },
@@ -313,8 +327,7 @@ export const useCategoryStore = create<CategoryState>((set, get) => ({
     if (cat.isBuiltIn) {
       await writePref(key, { label });
     } else {
-      const db = await getDb();
-      await db.runAsync(`UPDATE custom_categories SET label = ? WHERE key = ?`, [label, key]);
+      await renameCustomSpace(key, label);
     }
     await refresh(set);
   },
@@ -344,13 +357,19 @@ export const useCategoryStore = create<CategoryState>((set, get) => ({
     await refresh(set);
   },
 
+  setCategoryRule: async (key: string, rule: SpaceRule | null) => {
+    const cat = get().categories.find((c) => c.key === key);
+    // The built-ins are fed by the model; a rule on one would compete with it.
+    if (!cat || cat.isBuiltIn) return;
+    await setCustomSpaceRule(key, rule);
+    await refresh(set);
+  },
+
   removeCategory: async (key: string) => {
     const cat = get().categories.find((c) => c.key === key);
     if (cat?.isBuiltIn) return;
 
-    const db = await getDb();
-    await db.runAsync(`DELETE FROM custom_categories WHERE key = ?`, [key]);
-    await db.runAsync(`DELETE FROM category_prefs WHERE key = ?`, [key]);
+    await deleteCustomSpace(key);
     await refresh(set);
   },
 

@@ -73,11 +73,21 @@ const RESOLVED_LABEL: Record<string, string> = {
   Track: 'Tracked',
   Remind: 'Reminder set',
   'Remind me': 'Reminder set',
-  'Add to Calendar': 'Added to calendar',
+  'Add to Calendar': 'Opened in calendar',
   Ignore: 'Ignored',
   Dismiss: 'Dismissed',
   Revert: 'Reverted',
 };
+
+/**
+ * Actions that happen the moment they are tapped.
+ *
+ * Every other action waits out a short undo window before it commits.
+ * Opening the calendar cannot: the calendar app *is* the confirmation step,
+ * and a dialog that appears three seconds after the tap reads as the phone
+ * doing something on its own.
+ */
+const IMMEDIATE_ACTIONS = new Set(['calendar']);
 
 function InsightCardBase({
   insight,
@@ -112,31 +122,58 @@ function InsightCardBase({
   // rather than being snapped into place. Asymmetry is what gives a press a
   // feeling of substance; two matched timings feel like a value being toggled.
   const handlePressIn = useCallback(() => {
-    scale.value = withTiming(PRESS_CONFIG.pressed, { duration: PRESS_CONFIG.duration });
+    scale.set(withTiming(PRESS_CONFIG.pressed, { duration: PRESS_CONFIG.duration }));
   }, [scale]);
 
   const handlePressOut = useCallback(() => {
-    scale.value = withSpring(PRESS_CONFIG.normal, SPRING);
+    scale.set(withSpring(PRESS_CONFIG.normal, SPRING));
   }, [scale]);
 
   // ── Resolution, with a real undo window ──────────────────────────────────
-  const [resolved, setResolved] = useState<string | null>(null);
+  // `undoable` is state rather than "is the timer still set", because the
+  // timer lives in a ref and a ref is not something render may read.
+  const [resolution, setResolution] = useState<{ label: string; undoable: boolean } | null>(null);
+  const resolved = resolution?.label ?? null;
+  const canUndo = resolution?.undoable ?? false;
   const commitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // What the timer is waiting to do, so an unmount can finish it rather than
+  // lose it. Cleared the moment the commit runs or the user undoes it.
+  const pendingCommit = useRef<(() => void) | null>(null);
 
-  // The commit must never outlive the card, or it mutates a dead component.
+  /**
+   * The timer must never outlive the card — but the *decision* must.
+   *
+   * Clearing the timer on unmount and stopping there meant an action taken in
+   * the last three seconds before the card went away was silently dropped: the
+   * user saw "Tracked", the row was never written, and the card was back on the
+   * next load. The undo window exists so a mis-tap can be taken back, not so
+   * that leaving the screen takes it back for you. So the pending action is run
+   * on the way out; it talks to the store, not to this component, and the store
+   * outlives the card.
+   */
   useEffect(() => () => {
     if (commitTimer.current) clearTimeout(commitTimer.current);
+    commitTimer.current = null;
+    const commit = pendingCommit.current;
+    pendingCommit.current = null;
+    commit?.();
   }, []);
 
   const handleAction = (fn: () => void, label: string) => {
-    setResolved(label);
-    commitTimer.current = setTimeout(fn, UNDO_WINDOW_MS);
+    setResolution({ label, undoable: true });
+    pendingCommit.current = fn;
+    commitTimer.current = setTimeout(() => {
+      commitTimer.current = null;
+      pendingCommit.current = null;
+      fn();
+    }, UNDO_WINDOW_MS);
   };
 
   const handleUndo = () => {
     if (commitTimer.current) clearTimeout(commitTimer.current);
     commitTimer.current = null;
-    setResolved(null);
+    pendingCommit.current = null;
+    setResolution(null);
   };
 
   const actions = getContextualActions(insight.category);
@@ -201,7 +238,14 @@ function InsightCardBase({
       revert: onIgnore,
       dismiss: onIgnore,
     };
-    handleAction(fnMap[action.key] ?? onIgnore, action.label);
+    const fn = fnMap[action.key] ?? onIgnore;
+    if (IMMEDIATE_ACTIONS.has(action.key)) {
+      // No undo for something the calendar app has already been handed.
+      setResolution({ label: action.label, undoable: false });
+      fn();
+      return;
+    }
+    handleAction(fn, action.label);
   };
 
   const primaryAction = actions[0];
@@ -316,9 +360,11 @@ function InsightCardBase({
               <Text style={[styles.resolvedText, { color: A.action }]}>
                 {RESOLVED_LABEL[resolved] ?? 'Done'}
               </Text>
-              <TouchableOpacity onPress={handleUndo} hitSlop={12} activeOpacity={0.6}>
-                <Text style={[styles.undo, { color: A.action }]}>Undo</Text>
-              </TouchableOpacity>
+              {canUndo && (
+                <TouchableOpacity onPress={handleUndo} hitSlop={12} activeOpacity={0.6}>
+                  <Text style={[styles.undo, { color: A.action }]}>Undo</Text>
+                </TouchableOpacity>
+              )}
             </View>
           ) : isAuto ? (
             /* Handled, and the way back.

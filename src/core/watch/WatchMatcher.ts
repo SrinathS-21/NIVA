@@ -1,11 +1,12 @@
 import { randomUUID } from 'expo-crypto';
 import { insertAction, type Action } from '../../db/repositories/actions';
-import { updateInsightStatus, type Insight } from '../../db/repositories/insights';
+import { getInboxInsights, updateInsightStatus, type Insight } from '../../db/repositories/insights';
 import {
   getEnabledWatches,
   incrementWatchHandled,
   type Watch,
 } from '../../db/repositories/watches';
+import { scheduleReminder } from '../notify/Reminders';
 
 /**
  * Watches, applied.
@@ -154,6 +155,30 @@ function actionTypeFor(watch: Watch): Action['action_type'] {
   return watch.action_type === 'auto_track' ? 'track' : watch.action_type;
 }
 
+/** What status an applied action leaves the insight in. */
+function statusFor(actionType: Action['action_type']): Insight['status'] {
+  return actionType === 'ignore' ? 'dismissed' : 'actioned';
+}
+
+/**
+ * Is this insight's confidence a measurement, or a number this app chose?
+ *
+ * A *generic* card exists because the user's own space rule claimed a message
+ * the engine had no schema for. Its confidence is `GENERIC_CONFIDENCE` — a
+ * constant we picked so the card lands in Review, not something the model
+ * reported. Gating on it would mean a person who wrote "when something lands
+ * in Pets, remind me" gets no reminder, for a message their own words
+ * matched. The rule is the authority there; the gate exists to stop a *model*
+ * misreading being auto-filed, which is a different thing entirely.
+ */
+function confidenceIsMeasured(insight: Insight): boolean {
+  try {
+    return (JSON.parse(insight.entities_json) as { generic?: boolean }).generic !== true;
+  } catch {
+    return true;
+  }
+}
+
 /**
  * Runs every enabled watch against one insight and applies the first that
  * matches.
@@ -173,36 +198,100 @@ export async function applyWatches(insight: Insight): Promise<WatchMatch | null>
   if (watches.length === 0) return null;
 
   for (const watch of watches) {
-    if (!matchesTrigger(insight, parseTrigger(watch.trigger_json))) continue;
-
-    // A rule that matched still counts as a hit even when it is not allowed to
-    // act — that is what makes "3 handled" on the Watch card honest, and it is
-    // the signal that a rule is firing on things the model is unsure about.
-    await incrementWatchHandled(watch.id);
-
-    if (insight.confidence < MIN_AUTO_CONFIDENCE) {
-      return { watch, action: null, heldBack: 'low_confidence' };
-    }
-
-    const actionType = actionTypeFor(watch);
-    await updateInsightStatus(insight.id, 'actioned');
-    await insertAction({
-      id: randomUUID(),
-      insight_id: insight.id,
-      action_type: actionType,
-      payload_json: JSON.stringify({
-        via: 'watch',
-        watch_id: watch.id,
-        watch_title: watch.title,
-      }),
-      executed_at: Date.now(),
-    });
-
-    return { watch, action: actionType };
+    const trigger = parseTrigger(watch.trigger_json);
+    if (!matchesTrigger(insight, trigger)) continue;
+    return applyWatchToInsight(watch, insight, trigger);
   }
 
   return null;
 }
+
+/**
+ * One rule, one insight, applied.
+ *
+ * Split out of the loop so a newly written watch can be run over what is
+ * already waiting in the inbox — the person who just wrote "ignore Myntra"
+ * with four Myntra cards on screen expects them to go, not to wait for the
+ * fifth.
+ */
+export async function applyWatchToInsight(
+  watch: Watch,
+  insight: Insight,
+  trigger: WatchTrigger = parseTrigger(watch.trigger_json),
+): Promise<WatchMatch> {
+  // A rule that matched still counts as a hit even when it is not allowed to
+  // act — that is what makes "3 handled" on the Watch card honest, and it is
+  // the signal that a rule is firing on things the model is unsure about.
+  await incrementWatchHandled(watch.id);
+
+  if (confidenceIsMeasured(insight) && insight.confidence < MIN_AUTO_CONFIDENCE) {
+    return { watch, action: null, heldBack: 'low_confidence' };
+  }
+
+  const actionType = actionTypeFor(watch);
+
+  /**
+   * A rule that says "remind me" sets a real reminder, honouring the
+   * "3 days before" the user wrote. A rule that says "add to calendar"
+   * cannot open the calendar app on their behalf — that dialog is the
+   * confirmation step, and a watch is precisely the thing that runs
+   * without one — so it sets a reminder instead and says so, and the
+   * detail screen offers the calendar button when they open it.
+   */
+  let notificationId: string | null = null;
+  if (actionType === 'remind' || actionType === 'calendar') {
+    const scheduled = await scheduleReminder(insight, { daysBefore: trigger.daysBefore }).catch(() => null);
+    notificationId = scheduled?.id ?? null;
+  }
+
+  await updateInsightStatus(insight.id, statusFor(actionType));
+  await insertAction({
+    id: randomUUID(),
+    insight_id: insight.id,
+    action_type: actionType,
+    payload_json: JSON.stringify({
+      via: 'watch',
+      watch_id: watch.id,
+      watch_title: watch.title,
+      notificationId,
+      ...(actionType === 'calendar' ? { calendar: 'deferred' } : {}),
+    }),
+    executed_at: Date.now(),
+  });
+
+  return { watch, action: actionType };
+}
+
+/**
+ * Run a rule over everything currently waiting. Returns how many it handled.
+ *
+ * Low-confidence cards are skipped exactly as they would be live, so a new
+ * rule cannot do by batch what it is forbidden to do one at a time.
+ */
+export async function applyWatchToPending(watch: Watch): Promise<number> {
+  const trigger = parseTrigger(watch.trigger_json);
+  const pending = await getInboxInsights();
+  let handled = 0;
+  for (const insight of pending) {
+    if (!matchesTrigger(insight, trigger)) continue;
+    const match = await applyWatchToInsight(watch, insight, trigger);
+    if (match.action) handled += 1;
+  }
+  return handled;
+}
+
+/** "Matches: swiggy, zomato · over ₹500 · 3 days before" — the rule, in words. */
+export function describeTrigger(trigger: WatchTrigger): string {
+  const parts: string[] = [];
+  if (trigger.merchants?.length) parts.push(trigger.merchants.join(', '));
+  else if (trigger.keywords?.length) parts.push(trigger.keywords.join(', '));
+  if (trigger.minAmount !== undefined) parts.push(`over ₹${trigger.minAmount.toLocaleString('en-IN')}`);
+  if (trigger.maxAmount !== undefined) parts.push(`under ₹${trigger.maxAmount.toLocaleString('en-IN')}`);
+  if (trigger.daysBefore !== undefined) parts.push(`${trigger.daysBefore} days before`);
+  return parts.length ? parts.join(' · ') : 'everything in this space';
+}
+
+export { parseTrigger };
 
 // ─── Rule authoring ───────────────────────────────────────────────────────────
 
@@ -222,6 +311,18 @@ const STOP_WORDS = new Set([
   'this', 'to', 'track', 'up', 'want', 'was', 'watch', 'we', 'what', 'when',
   'where', 'which', 'with', 'you', 'your',
 ]);
+
+/**
+ * A trigger for a rule the app proposed, rather than one the user wrote.
+ *
+ * Learned policies ("always track Swiggy payments") arrive with the merchant
+ * already known, so there is no sentence to parse. Kept next to
+ * `buildTriggerFromText` so the two ways a trigger comes to exist sit
+ * together.
+ */
+export function buildTriggerForEntity(category: string, entity: string): WatchTrigger {
+  return { category, merchants: [entity.toLowerCase()] };
+}
 
 /**
  * Turns what the user typed into something matchable.

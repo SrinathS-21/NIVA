@@ -9,7 +9,8 @@
     "scheme": "niva",
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.nivaapp.niva"
+      "bundleIdentifier": "com.nivaapp.niva",
+      "buildNumber": "1"
     },
     "backgroundColor": "#F8F9FC",
     "android": {
@@ -20,22 +21,47 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "package": "com.nivaapp.niva",
+      "versionCode": 1,
       "predictiveBackGestureEnabled": true,
+      "allowBackup": false,
       "permissions": [
         "android.permission.RECEIVE_BOOT_COMPLETED",
-        "android.permission.READ_SMS",
-        "android.permission.RECEIVE_SMS",
-        "android.permission.BIND_NOTIFICATION_LISTENER_SERVICE",
         "android.permission.VIBRATE",
         "android.permission.POST_NOTIFICATIONS"
+      ],
+      "blockedPermissions": [
+        "android.permission.READ_CALENDAR",
+        "android.permission.WRITE_CALENDAR",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
       ]
     },
     "plugins": [
       "expo-router",
       "expo-font",
-      "./plugins/withNivaNative.js",
+      [
+        "./plugins/withNivaNative.js",
+        {
+          "smsCapture": false
+        }
+      ],
       "expo-sqlite",
       "expo-system-ui",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#5527F9",
+          "defaultChannel": "niva-briefing"
+        }
+      ],
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": false,
+          "remindersPermission": false
+        }
+      ],
       [
         "expo-splash-screen",
         {
@@ -47,7 +73,8 @@
             "backgroundColor": "#0A0C10"
           }
         }
-      ]
+      ],
+      "expo-sharing"
     ]
   }
 }

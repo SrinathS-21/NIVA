@@ -130,3 +130,96 @@ export function isWithinQuietHours(date = new Date()): boolean {
   const hour = date.getHours();
   return hour >= 22 || hour < 8;
 }
+
+// ─── Morning briefing ─────────────────────────────────────────────────────────
+
+export interface DigestPrefs {
+  enabled: boolean;
+  /** Local clock time. */
+  hour: number;
+  minute: number;
+  /** Send even on a day with nothing due — "all clear" is still news. */
+  whenEmpty: boolean;
+}
+
+const DIGEST_DEFAULTS: DigestPrefs = { enabled: true, hour: 8, minute: 0, whenEmpty: true };
+
+/**
+ * When the day's briefing arrives.
+ *
+ * Eight in the morning by default, which is late enough to be awake and
+ * early enough that a bill due today can still be paid before work. The
+ * user moves it from the Notifications page.
+ */
+export async function getDigestPrefs(): Promise<DigestPrefs> {
+  const raw = await getSetting('digest_prefs', '');
+  if (!raw) return { ...DIGEST_DEFAULTS };
+  try {
+    return { ...DIGEST_DEFAULTS, ...(JSON.parse(raw) as Partial<DigestPrefs>) };
+  } catch {
+    return { ...DIGEST_DEFAULTS };
+  }
+}
+
+export async function setDigestPrefs(prefs: DigestPrefs): Promise<void> {
+  await setSetting('digest_prefs', JSON.stringify(prefs));
+}
+
+// ─── Milestones ───────────────────────────────────────────────────────────────
+
+/**
+ * Whether the app has ever produced a real insight for this person.
+ *
+ * The first one is the moment the product proves itself — Needle surfacing
+ * something true out of the noise — and it is celebrated once, then never
+ * again. A milestone that repeats is a nag.
+ */
+export async function getFirstInsightSeen(): Promise<boolean> {
+  return (await getSetting('first_insight_seen', 'false')) === 'true';
+}
+
+export async function setFirstInsightSeen(): Promise<void> {
+  await setSetting('first_insight_seen', 'true');
+}
+
+/** The hour a "remind me" fires at, when the message gives no time of its own. */
+export const DEFAULT_REMINDER_HOUR = 9;
+
+// ─── Engine download ──────────────────────────────────────────────────────────
+
+export type DownloadPolicy = 'wifi' | 'any';
+
+/**
+ * Whether a 199 MB engine may be fetched over mobile data.
+ *
+ * Wi-Fi only by default. A first launch on a metered connection used to start
+ * the download silently — a fifth of a gigabyte nobody agreed to. The
+ * onboarding step asks; this remembers the answer.
+ */
+export async function getDownloadPolicy(): Promise<DownloadPolicy> {
+  return (await getSetting('engine_download_policy', 'wifi')) === 'any' ? 'any' : 'wifi';
+}
+
+export async function setDownloadPolicy(policy: DownloadPolicy): Promise<void> {
+  await setSetting('engine_download_policy', policy);
+}
+
+// ─── Learned policies ─────────────────────────────────────────────────────────
+
+/**
+ * Offers the person has said "not now" to. Never repeated.
+ *
+ * A suggestion that comes back is a nag, and a nag is the opposite of what a
+ * learned policy is for. Keyed by the suggestion's stable key, e.g.
+ * `always:track:finance:swiggy`.
+ */
+export async function getDismissedSuggestions(): Promise<Set<string>> {
+  const raw = await getSetting('dismissed_suggestions', '');
+  return new Set(raw ? raw.split('\n').filter(Boolean) : []);
+}
+
+export async function addDismissedSuggestion(key: string): Promise<void> {
+  const current = await getDismissedSuggestions();
+  current.add(key);
+  await setSetting('dismissed_suggestions', [...current].join('\n'));
+}

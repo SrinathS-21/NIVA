@@ -30,6 +30,7 @@ export function SignalSourcesCard({ isDark, variant = 'full' }: Props) {
   const A = accent(isDark);
 
   const supported = useCaptureStore((st) => st.supported);
+  const smsAvailable = useCaptureStore((st) => st.smsAvailable);
   const notificationsGranted = useCaptureStore((st) => st.notificationsGranted);
   const smsGranted = useCaptureStore((st) => st.smsGranted);
   const notificationsEnabled = useCaptureStore((st) => st.notificationsEnabled);
@@ -77,7 +78,9 @@ export function SignalSourcesCard({ isDark, variant = 'full' }: Props) {
           <Text style={[styles.title, { color: P.ink }]}>Notifications</Text>
           <Text style={[styles.sub, { color: P.inkMuted }]}>
             {notificationsGranted
-              ? 'Niva can read your notification shade'
+              ? smsAvailable
+                ? 'Niva can read your notification shade'
+                : 'Niva can read your notification shade, including SMS as they arrive'
               : 'Needed to notice bills, deliveries and payments'}
           </Text>
         </View>
@@ -95,9 +98,13 @@ export function SignalSourcesCard({ isDark, variant = 'full' }: Props) {
         )}
       </View>
 
+      {/* ── SMS ───────────────────────────────────────────────────────────
+          Only in builds that compile the receiver in. A store build reads
+          SMS through the messaging app's notification instead, and a switch
+          with nothing behind it would read as broken. */}
+      {smsAvailable && (
+      <>
       <View style={[styles.divider, { backgroundColor: P.stroke }]} />
-
-      {/* ── SMS ───────────────────────────────────────────────────────────── */}
       <View style={styles.row}>
         <View style={[styles.icon, { backgroundColor: smsGranted ? A.successSoft : A.brandSoft }]}>
           <MessageSquare size={18} color={smsGranted ? A.success : A.brand} strokeWidth={1.75} />
@@ -123,6 +130,8 @@ export function SignalSourcesCard({ isDark, variant = 'full' }: Props) {
           </TouchableOpacity>
         )}
       </View>
+      </>
+      )}
 
       {variant === 'full' && (
         <>

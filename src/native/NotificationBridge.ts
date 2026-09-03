@@ -50,6 +50,28 @@ export const SIGNAL_EVENT = 'NivaSignal';
 /** Whether this build can capture anything at all. */
 export const isCaptureSupported = Platform.OS === 'android' && !!NivaModule;
 
+/**
+ * Whether this build reads SMS directly.
+ *
+ * Decided at build time by the config plugin (`smsCapture` in app.json) and
+ * read back from the module's constants. Off in store builds — see the
+ * plugin for why — in which case bank alerts still arrive through the
+ * messaging app's notification, and the SMS switch is simply not shown.
+ */
+export const isSmsCaptureAvailable: boolean = (() => {
+  if (!isCaptureSupported) return false;
+  try {
+    const mod = NivaModule as unknown as {
+      getConstants?: () => { smsCaptureAvailable?: boolean };
+      smsCaptureAvailable?: boolean;
+    };
+    const consts = typeof mod.getConstants === 'function' ? mod.getConstants() : mod;
+    return consts?.smsCaptureAvailable === true;
+  } catch {
+    return false;
+  }
+})();
+
 // ─── Notification access ──────────────────────────────────────────────────────
 
 export async function isNotificationAccessGranted(): Promise<boolean> {

@@ -1,5 +1,6 @@
 import { getInsightsForMetrics, type Insight } from '../../db/repositories/insights';
 import { resolveUrgency } from '../../utils/urgency';
+import { detectSubscriptions, monthlySubscriptionCost } from '../insights/Subscriptions';
 
 /**
  * What a space is actually worth, computed from what is in the database.
@@ -41,6 +42,9 @@ export interface SpaceMetrics {
   inTransit?: number;
   /** delivery — completed. */
   delivered?: number;
+  /** finance — recurring debits Niva has spotted, and what they add up to a month. */
+  subscriptions?: number;
+  subscriptionsMonthly?: number;
 }
 
 export type SpaceMetricsMap = Record<string, SpaceMetrics>;
@@ -80,6 +84,9 @@ function isSameMonth(ts: number, now: Date): boolean {
  * income is the mistake that would actually mislead someone.
  */
 function financeDirection(entities: Record<string, unknown>): 'in' | 'out' {
+  // The validator says so directly now; the shape-sniffing below is for rows
+  // written before it did.
+  if (entities.direction === 'in' || entities.direction === 'out') return entities.direction;
   if (typeof entities.source === 'string' && entities.source) return 'in';
   if (typeof entities.type === 'string' && /salary|refund|cashback|interest|credit/i.test(entities.type)) {
     return 'in';
@@ -178,6 +185,14 @@ export function computeSpaceMetrics(insights: Insight[]): SpaceMetricsMap {
         // more — there is no schema behind it to aggregate.
         break;
     }
+  }
+
+  // Subscriptions are a property of the whole debit history, not of one row.
+  const subs = detectSubscriptions(insights);
+  if (subs.length > 0) {
+    const m = bucket('finance');
+    m.subscriptions = subs.length;
+    m.subscriptionsMonthly = monthlySubscriptionCost(subs);
   }
 
   return map;

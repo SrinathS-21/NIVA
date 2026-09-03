@@ -515,6 +515,8 @@ export const CATEGORY_ACCENT: Record<string, { color: string; soft: string; labe
 
 // ── Border Radius ────────────────────────────────────────────────────────────
 export const RADIUS = {
+  /** Data-ends on chart marks. 4px reads as rounded at 6px-thick bars without going capsule. */
+  xs: 4,
   sm: 8,
   md: 12,
   lg: 14,   // Cards

@@ -5,7 +5,11 @@ export interface Watch {
   title: string;
   description: string | null;
   category: string;
-  action_type: 'track' | 'remind' | 'calendar' | 'auto_track';
+  /**
+   * `ignore` is the negative rule — "stop showing me X". It is the one that
+   * earns trust fastest, because noise is what people uninstall over.
+   */
+  action_type: 'track' | 'remind' | 'calendar' | 'auto_track' | 'ignore';
   trigger_json: string;
   enabled: number;
   created_at: number;

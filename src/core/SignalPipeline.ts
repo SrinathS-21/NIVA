@@ -2,8 +2,12 @@ import { normalizeSignal } from './normalizer/SignalNormalizer';
 import { NeedleEngine } from './needle/NeedleEngine';
 import { validateAndFormatInsight } from './validator/InsightValidator';
 import { applyWatches, type WatchMatch } from './watch/WatchMatcher';
+import { routeRawText, routeToSpace, type RoutableSpace } from './spaces/SpaceRouter';
+import { buildGenericInsight } from './spaces/GenericInsight';
+import { reconcileBill } from './reconcile/reconcileBill';
 import { insertSignal, updateSignalStatus } from '../db/repositories/signals';
 import { insertInsight, type Insight } from '../db/repositories/insights';
+import { getRoutableSpaces } from '../db/repositories/spaces';
 import { generateId } from '../utils/helpers';
 
 export interface ProcessSignalInput {
@@ -24,6 +28,8 @@ export type PipelineStatus =
   | 'filtered_noise'
   | 'otp_extracted'
   | 'model_not_ready'
+  /** The engine threw. The signal stays pending and is retried on the next foreground. */
+  | 'classification_failed'
   | 'validation_failed'
   | 'duplicate';
 
@@ -34,7 +40,20 @@ export interface PipelineResult {
   reason?: string;
   /** Set when a watch claimed the insight, so the caller can skip the inbox. */
   watchMatch?: WatchMatch | null;
+  /** Set when a user-made space's rule claimed the insight. */
+  routedTo?: string | null;
+  /** Set when this insight was a payment that settled a pending bill. */
+  reconciledBillId?: string | null;
 }
+
+/**
+ * The most text the engine is asked to read at once.
+ *
+ * A WhatsApp group digest or a forwarded newsletter can run to thousands of
+ * characters; the consequence, if there is one, is in the first few hundred.
+ * A small model given a wall of text gets slower and less accurate, not more.
+ */
+const MAX_MODEL_CHARS = 1500;
 
 /**
  * A stable identity for one real-world message.
@@ -51,7 +70,10 @@ export interface PipelineResult {
  * app's notification of it) differs by a few hundred milliseconds — which is
  * the same message, and should collapse to one card.
  */
-function dedupeKeyFor(input: ProcessSignalInput, receivedAt: number): string {
+export function dedupeKeyFor(
+  input: Pick<ProcessSignalInput, 'rawText' | 'source' | 'sender'>,
+  receivedAt: number,
+): string {
   const minute = Math.floor(receivedAt / 60_000);
   const body = input.rawText.replace(/\s+/g, ' ').trim().toLowerCase();
   return `${input.source}|${input.sender ?? ''}|${minute}|${body}`;
@@ -60,16 +82,18 @@ function dedupeKeyFor(input: ProcessSignalInput, receivedAt: number): string {
 /**
  * End-to-end signal pipeline.
  *
- * 1. Record the raw signal, rejecting duplicates
- * 2. Normalize — drop promo/social/system noise, pull OTPs out
- * 3. Classify with the on-device engine
- * 4. Validate the tool call against its Zod schema
- * 5. Store the insight
- * 6. Offer it to the user's watches, which may action it immediately
- *
- * Step 6 is the one that was missing. Without it every insight landed in the
- * inbox regardless of what the user had already told Niva to do with that kind
- * of thing.
+ *  1. Record the raw signal, rejecting duplicates
+ *  2. Ask the user's own spaces whether they want this message — before any
+ *     filter, because a rule the person wrote outranks a heuristic
+ *  3. Normalize — drop promo/social/system noise (unless a space claimed it),
+ *     pull OTPs out
+ *  4. Classify with the on-device engine
+ *  5. Validate the tool call against its Zod schema — or, for a message a
+ *     space claimed that the engine has no schema for, build a plain card
+ *  6. Route to a user-made space
+ *  7. Store the insight
+ *  8. Settle a bill this payment pays
+ *  9. Offer it to the user's watches, which may action it immediately
  */
 export async function processSignal(input: ProcessSignalInput): Promise<PipelineResult> {
   const signalId = generateId();
@@ -92,7 +116,13 @@ export async function processSignal(input: ProcessSignalInput): Promise<Pipeline
     return { status: 'duplicate', reason: 'already_captured' };
   }
 
-  return runPipeline(signalId, input.rawText, receivedAt);
+  return runPipeline({
+    id: signalId,
+    raw_text: input.rawText,
+    received_at: receivedAt,
+    sender: input.sender ?? null,
+    package_name: input.packageName ?? null,
+  });
 }
 
 /**
@@ -108,19 +138,41 @@ export async function reprocessStoredSignal(signal: {
   id: string;
   raw_text: string;
   received_at: number;
+  sender?: string | null;
+  package_name?: string | null;
 }): Promise<PipelineResult> {
-  return runPipeline(signal.id, signal.raw_text, signal.received_at);
+  return runPipeline(signal);
 }
 
-async function runPipeline(
-  signalId: string,
-  rawText: string,
-  receivedAt: number,
-): Promise<PipelineResult> {
-  // 2. Normalization & fast filter
+async function loadSpaces(): Promise<RoutableSpace[]> {
+  try {
+    return await getRoutableSpaces();
+  } catch (err) {
+    console.warn('[SignalPipeline] Could not read spaces:', err);
+    return [];
+  }
+}
+
+async function runPipeline(signal: {
+  id: string;
+  raw_text: string;
+  received_at: number;
+  sender?: string | null;
+  package_name?: string | null;
+}): Promise<PipelineResult> {
+  const signalId = signal.id;
+  const rawText = signal.raw_text;
+  const receivedAt = signal.received_at;
+  const routeCtx = { sender: signal.sender, packageName: signal.package_name };
+
+  // 2. The user's own spaces get the first look, at the raw text.
+  const spaces = await loadSpaces();
+  const claimedEarly = spaces.length ? routeRawText(rawText, spaces, routeCtx) : null;
+
+  // 3. Normalization & fast filter — a claimed message skips the noise filter.
   const norm = normalizeSignal(rawText);
 
-  if (norm.discarded) {
+  if (norm.discarded && !claimedEarly) {
     await updateSignalStatus(signalId, 'filtered_out');
     return {
       status: 'filtered_noise',
@@ -128,7 +180,7 @@ async function runPipeline(
     };
   }
 
-  // If it's an OTP, handle as quick copy chip rather than full insight card
+  // An OTP is an OTP whatever space it might have matched.
   if (norm.signal?.isOtp && norm.signal.otpCode) {
     await updateSignalStatus(signalId, 'processed');
     return {
@@ -137,9 +189,9 @@ async function runPipeline(
     };
   }
 
-  const cleanText = norm.signal?.cleanText ?? rawText;
+  const cleanText = (norm.signal?.cleanText ?? rawText).slice(0, MAX_MODEL_CHARS);
 
-  // 3. Check Needle Engine readiness.
+  // 4. Check Needle Engine readiness.
   //
   // The signal is left `pending` on purpose. The engine is downloaded and
   // warmed up by modelStore, and anything captured before that finishes is
@@ -152,52 +204,76 @@ async function runPipeline(
     };
   }
 
-  // 4. Model Classification
+  // Model classification. A throw here — the engine being swapped under a
+  // running call, a transient runtime error — leaves the signal pending so
+  // the next foreground retries it. Marking it filtered would lose a real
+  // message over a hiccup.
   let modelResult;
   try {
     modelResult = await NeedleEngine.classify(cleanText);
   } catch (err) {
     console.error('[SignalPipeline] Classification error:', err);
-    await updateSignalStatus(signalId, 'filtered_out');
     return {
-      status: 'validation_failed',
+      status: 'classification_failed',
       reason: String(err),
     };
   }
 
-  if (!modelResult) {
+  // 5. Zod Validation & Formatting.
+  //
+  // The sender and the arrival time go in alongside the model's output. The
+  // model was never shown the sender, and it is the most reliable "who" there
+  // is; the arrival time is what makes "tomorrow" resolve to a real day.
+  const validated = modelResult
+    ? validateAndFormatInsight(
+        modelResult.toolName,
+        modelResult.arguments,
+        modelResult.confidence,
+        { sender: signal.sender, packageName: signal.package_name, receivedAt },
+      )
+    : null;
+
+  let category: string;
+  let routedTo: string | null = null;
+  let data = validated;
+
+  if (data && data.category !== 'noise') {
+    // 6. A user-made space gets first claim over the engine's category.
+    //
+    // The model only knows the five built-in domains. Without this step every
+    // insight landed in one of them and a space the user had made — "Pets",
+    // "Rent", "Side project" — could never receive anything at all.
+    routedTo =
+      claimedEarly ??
+      routeToSpace(
+        { title: data.title, summary: data.summary, entities_json: JSON.stringify(data.entities) },
+        spaces,
+        routeCtx,
+      );
+    category = routedTo ?? data.category;
+  } else if (claimedEarly) {
+    // The engine had no schema for it, but a space asked for it by name.
+    // Make the plain card rather than lose the message.
+    data = buildGenericInsight(rawText, { sender: signal.sender, receivedAt });
+    routedTo = claimedEarly;
+    category = claimedEarly;
+  } else {
     await updateSignalStatus(signalId, 'filtered_out');
-    return {
-      status: 'filtered_noise',
-      reason: 'model_classified_as_noise',
-    };
+    return modelResult
+      ? { status: 'validation_failed', reason: 'schema_validation_failed' }
+      : { status: 'filtered_noise', reason: 'model_classified_as_noise' };
   }
 
-  // 5. Zod Validation & Formatting
-  const validated = validateAndFormatInsight(
-    modelResult.toolName,
-    modelResult.arguments,
-    modelResult.confidence,
-  );
-
-  if (!validated || validated.category === 'noise') {
-    await updateSignalStatus(signalId, 'filtered_out');
-    return {
-      status: 'validation_failed',
-      reason: 'schema_validation_failed',
-    };
-  }
-
-  // 6. Store Insight
+  // 7. Store Insight
   const insightId = generateId();
   const insight: Insight = {
     id: insightId,
     signal_id: signalId,
-    category: validated.category,
-    title: validated.title,
-    summary: validated.summary,
-    entities_json: JSON.stringify(validated.entities),
-    confidence: validated.confidence,
+    category,
+    title: data.title,
+    summary: data.summary,
+    entities_json: JSON.stringify(data.entities),
+    confidence: data.confidence,
     status: 'inbox',
     created_at: receivedAt,
     actioned_at: null,
@@ -206,7 +282,15 @@ async function runPipeline(
   await insertInsight(insight);
   await updateSignalStatus(signalId, 'processed');
 
-  // 7. Standing rules get first refusal.
+  // 8. A payment settles the bill it pays.
+  //
+  // "₹8,420 due 24-08" and "₹8,420 debited · HDFC CARD" are two messages
+  // about one obligation. Left alone, the first keeps nagging after the
+  // second has arrived — the fastest way to make someone stop trusting the
+  // inbox. Only finance debits are candidates, and the matcher is strict.
+  const reconciledBillId = insight.category === 'finance' ? await reconcileBill(insight) : null;
+
+  // 9. Standing rules get first refusal.
   //
   // A failure here must not lose the insight — it is already stored, and the
   // worst case of a broken rule is that the user sees an item they had asked
@@ -221,8 +305,10 @@ async function runPipeline(
   return {
     status: 'insight_created',
     insight: watchMatch?.action
-      ? { ...insight, status: 'actioned', actioned_at: Date.now() }
+      ? { ...insight, status: watchMatch.action === 'ignore' ? 'dismissed' : 'actioned', actioned_at: Date.now() }
       : insight,
     watchMatch,
+    routedTo,
+    reconciledBillId,
   };
 }

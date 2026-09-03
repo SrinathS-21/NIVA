@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useFocusEffect } from 'expo-router';
-import { useTabReset } from '../../src/store/tabResetContext';
+import { useTabResetHandler } from '../../src/store/tabResetContext';
 import {
   View,
   Text,
@@ -20,14 +20,26 @@ import { reportInteraction } from '../../src/store/activityStore';
 import { SignalInjectorModal } from '../../src/components/settings/SignalInjectorModal';
 import { SignalSourcesCard } from '../../src/components/settings/SignalSourcesCard';
 import { EngineSelector } from '../../src/components/settings/EngineSelector';
-import { clearAllInsights } from '../../src/db/repositories/insights';
+import { clearAllInsights, getInsightsForMetrics } from '../../src/db/repositories/insights';
 import { clearAllSignals } from '../../src/db/repositories/signals';
 import { clearAllActions } from '../../src/db/repositories/actions';
 import {
-  getNotificationPrefs,
-  setNotificationPrefs,
-  type NotificationPrefs,
+  getDigestPrefs,
+  setDigestPrefs,
+  type DigestPrefs,
 } from '../../src/db/repositories/settings';
+import { useOnboardingStore } from '../../src/store/onboardingStore';
+import {
+  getNotificationPermission,
+  requestNotificationPermission,
+  scheduleAt,
+  cancelWithPrefix,
+  CHANNELS,
+  ID_PREFIX,
+} from '../../src/core/notify/Notifier';
+import { rescheduleDigests } from '../../src/core/digest/DigestScheduler';
+import { buildDigest } from '../../src/core/digest/Digest';
+import { humanTime } from '../../src/utils/dates';
 import { useInboxStore } from '../../src/store/inboxStore';
 import { useSpaceMetricsStore } from '../../src/store/spaceMetricsStore';
 import { useCaptureStore } from '../../src/store/captureStore';
@@ -52,14 +64,21 @@ import {
   ChevronDown,
   Trash2,
   Sparkles,
+  RotateCcw,
+  FileSpreadsheet,
+  FileJson,
 } from 'lucide-react-native';
+import { exportInsightsCsv, exportEverythingJson } from '../../src/core/export/Exporter';
 
 /* ─── Menu items ─────────────────────────────────────────────── */
 
 const MENU_ITEMS = [
   { key: 'settings',     icon: Settings, label: 'Settings',       subtitle: 'Sources, appearance, model & data' },
   { key: 'connected',    icon: Link2,    label: 'Connected tools', subtitle: 'Calendar, tasks, finance apps' },
-  { key: 'notifications', icon: Bell,    label: 'Notifications',  subtitle: 'Quiet hours, categories' },
+  // The subtitle names what the page actually holds. It used to promise
+  // "Quiet hours, categories" — neither of which exists there, and a menu row
+  // that describes a different screen is how a settings page reads as broken.
+  { key: 'notifications', icon: Bell,    label: 'Notifications',  subtitle: 'Morning briefing & reminders' },
   { key: 'about',        icon: Info,     label: 'About Niva',     subtitle: 'v1.0.0 · On-device intelligence' },
 ] as const;
 
@@ -194,6 +213,10 @@ function SettingsPage({
             await clearAllActions();
             await clearAllInsights();
             await clearAllSignals();
+            // Reminders for insights that no longer exist must not ring, and
+            // the briefing should describe an empty inbox, not the old one.
+            await cancelWithPrefix(ID_PREFIX.reminder);
+            await rescheduleDigests();
             // And the screens have to be told, or the inbox keeps rendering a
             // list whose rows are gone until the next cold start.
             await useInboxStore.getState().loadInbox();
@@ -267,9 +290,24 @@ function SettingsPage({
         </View>
 
         {/* ── Data ────────────────────────────────────────────── */}
+        {/* Yours to take. Privacy that cannot be exported is lock-in. */}
         <View style={settingsStyles.sectionWrap}>
           <Text style={[settingsStyles.sectionLabel, { color: P.inkDim }]}>Data</Text>
           <View style={[settingsStyles.group, { backgroundColor: P.surface, borderColor: P.stroke }]}>
+            <SettingsRow
+              icon={<FileSpreadsheet size={18} color={A.brand} strokeWidth={1.75} />}
+              title="Export as spreadsheet"
+              subtitle="Every insight as a CSV — dates, amounts, spaces"
+              onPress={() => { exportInsightsCsv().catch(console.error); }}
+              P={P}
+            />
+            <SettingsRow
+              icon={<FileJson size={18} color={A.brand} strokeWidth={1.75} />}
+              title="Export everything"
+              subtitle="Insights, actions, watches and spaces as JSON. Message text stays here."
+              onPress={() => { exportEverythingJson().catch(console.error); }}
+              P={P}
+            />
             <SettingsRow
               icon={<Trash2 size={18} color={A.danger} strokeWidth={1.75} />}
               title="Clear all data"
@@ -317,27 +355,64 @@ function NotificationsPage({
   const A = accent(isDark);
 
   /**
-   * These were three `useState(true)` calls and nothing else, so every switch
-   * snapped back to its default the moment you navigated away. A settings
-   * screen that forgets is worse than one that does not exist, because it
-   * looks like it worked.
+   * The morning briefing's controls.
+   *
+   * This page used to hold three switches — insight alerts, watch alerts,
+   * quiet hours — that were saved and never read, for notifications the app
+   * never sent. Everything here now is a control over something that fires.
    */
-  const [prefs, setPrefs] = useState<NotificationPrefs | null>(null);
+  const [prefs, setPrefs] = useState<DigestPrefs | null>(null);
+  const [permission, setPermission] = useState<'granted' | 'denied' | 'undetermined'>('undetermined');
+  const [previewSent, setPreviewSent] = useState(false);
 
   useEffect(() => {
-    getNotificationPrefs().then(setPrefs).catch(console.error);
+    getDigestPrefs().then(setPrefs).catch(console.error);
+    getNotificationPermission().then(setPermission).catch(() => {});
   }, []);
 
-  const update = useCallback((patch: Partial<NotificationPrefs>) => {
+  const update = useCallback((patch: Partial<DigestPrefs>) => {
     setPrefs((current) => {
       if (!current) return current;
       const next = { ...current, ...patch };
       // Optimistic: the switch has already moved under the user's thumb, and
       // a write to a local SQLite row does not fail in a way worth animating.
-      setNotificationPrefs(next).catch(console.error);
+      setDigestPrefs(next)
+        .then(() => rescheduleDigests())
+        .catch(console.error);
       return next;
     });
   }, []);
+
+  const allow = async () => {
+    const ok = await requestNotificationPermission();
+    setPermission(ok ? 'granted' : 'denied');
+    if (ok) rescheduleDigests().catch(() => {});
+  };
+
+  /**
+   * "Send me one now." The single most convincing thing this page can do:
+   * the exact text tomorrow's briefing would carry, three seconds from now.
+   */
+  const sendPreview = async () => {
+    const rows = await getInsightsForMetrics(600);
+    const digest = buildDigest(rows, new Date());
+    // Not under the `digest:` prefix: a settings change in the next three
+    // seconds would reschedule the week and cancel this with it.
+    await scheduleAt(
+      'preview:digest',
+      {
+        title: digest.title,
+        body: digest.lines.length > 1 ? digest.lines.join('\n') : digest.body,
+        data: { url: '/', kind: 'digest' },
+      },
+      new Date(Date.now() + 3000),
+      CHANNELS.digest,
+    );
+    setPreviewSent(true);
+    setTimeout(() => setPreviewSent(false), 4000);
+  };
+
+  const HOURS = [6, 7, 8, 9, 10];
 
   return (
     <>
@@ -347,51 +422,125 @@ function NotificationsPage({
           <Text style={[subStyles.backLabel, { color: A.brand }]}>Back</Text>
         </TouchableOpacity>
         <Text style={[subStyles.title, { color: P.ink }]}>Notifications</Text>
-        <Text style={[subStyles.sub, { color: P.inkMuted }]}>Control when Niva alerts you</Text>
+        <Text style={[subStyles.sub, { color: P.inkMuted }]}>One briefing a day, plus the reminders you set</Text>
       </View>
       <ScrollView contentContainerStyle={{ paddingBottom: 96 }} onScroll={reportInteraction} scrollEventThrottle={50}>
+        {permission !== 'granted' && (
+          <View style={subStyles.sectionWrap}>
+            <View style={[subStyles.group, { backgroundColor: P.surface, borderColor: A.warning }]}>
+              <View style={subStyles.row}>
+                <View style={subStyles.rowTextWrap}>
+                  <Text style={[subStyles.rowTitle, { color: P.ink }]}>Notifications are off</Text>
+                  <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>
+                    {permission === 'denied'
+                      ? 'Allow Niva in your phone’s notification settings to get the briefing and reminders.'
+                      : 'Allow notifications to get the morning briefing and any reminders you set.'}
+                  </Text>
+                </View>
+                {permission === 'undetermined' && (
+                  <TouchableOpacity onPress={allow} activeOpacity={0.7}>
+                    <Text style={[subStyles.connectBtn, { color: A.brand }]}>Allow</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+          </View>
+        )}
+
         <View style={subStyles.sectionWrap}>
+          <Text style={[subStyles.aboutSectionLabel, { color: P.inkDim }]}>Morning briefing</Text>
           <View style={[subStyles.group, { backgroundColor: P.surface, borderColor: P.stroke }]}>
             <View style={subStyles.row}>
+              <View style={[subStyles.rowIcon, { backgroundColor: A.brandSoft }]}>
+                <Sun size={18} color={A.brand} strokeWidth={1.75} />
+              </View>
               <View style={subStyles.rowTextWrap}>
-                <Text style={[subStyles.rowTitle, { color: P.ink }]}>Insight notifications</Text>
-                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>Get notified when Niva surfaces a new insight</Text>
+                <Text style={[subStyles.rowTitle, { color: P.ink }]}>Daily briefing</Text>
+                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>What is due, arriving and overdue today, in one message</Text>
               </View>
               <Switch
-                value={prefs?.insights ?? true}
-                onValueChange={(v) => update({ insights: v })}
+                value={prefs?.enabled ?? true}
+                onValueChange={(v) => update({ enabled: v })}
                 disabled={!prefs}
                 trackColor={{ false: P.strokeStrong, true: A.brandSoft }}
-                thumbColor={prefs?.insights ? A.brand : P.surface}
+                thumbColor={prefs?.enabled ? A.brand : P.surface}
               />
             </View>
+
+            <View style={[subStyles.divider, { backgroundColor: P.stroke }]} />
+            <View style={[subStyles.row, { flexDirection: 'column', alignItems: 'stretch', gap: 10 }]}>
+              <Text style={[subStyles.rowTitle, { color: P.ink }]}>
+                Arrives at {prefs ? humanTime(prefs.hour, prefs.minute) : '8:00 AM'}
+              </Text>
+              <View style={subStyles.chipRow}>
+                {HOURS.map((h) => {
+                  const on = prefs?.hour === h;
+                  return (
+                    <TouchableOpacity
+                      key={h}
+                      onPress={() => update({ hour: h, minute: 0 })}
+                      disabled={!prefs?.enabled}
+                      activeOpacity={0.7}
+                      style={[subStyles.chip, {
+                        backgroundColor: on ? A.brandSoft : P.canvas,
+                        borderColor: on ? A.brand : P.stroke,
+                        opacity: prefs?.enabled ? 1 : 0.5,
+                      }]}
+                    >
+                      <Text style={[subStyles.chipText, { color: on ? A.brand : P.inkMuted, fontFamily: on ? FONT.semibold : FONT.medium }]}>
+                        {humanTime(h, 0).replace(':00', '')}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
+
             <View style={[subStyles.divider, { backgroundColor: P.stroke }]} />
             <View style={subStyles.row}>
               <View style={subStyles.rowTextWrap}>
-                <Text style={[subStyles.rowTitle, { color: P.ink }]}>Watch alerts</Text>
-                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>Alert when a watch rule matches a new signal</Text>
+                <Text style={[subStyles.rowTitle, { color: P.ink }]}>Even when nothing is due</Text>
+                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>An “all clear” is still worth knowing. Off means quiet days stay quiet.</Text>
               </View>
               <Switch
-                value={prefs?.watchAlerts ?? true}
-                onValueChange={(v) => update({ watchAlerts: v })}
-                disabled={!prefs}
+                value={prefs?.whenEmpty ?? true}
+                onValueChange={(v) => update({ whenEmpty: v })}
+                disabled={!prefs || !prefs.enabled}
                 trackColor={{ false: P.strokeStrong, true: A.brandSoft }}
-                thumbColor={prefs?.watchAlerts ? A.brand : P.surface}
+                thumbColor={prefs?.whenEmpty ? A.brand : P.surface}
               />
             </View>
+
             <View style={[subStyles.divider, { backgroundColor: P.stroke }]} />
-            <View style={subStyles.row}>
+            <TouchableOpacity
+              style={subStyles.row}
+              onPress={() => { sendPreview().catch(console.error); }}
+              activeOpacity={0.7}
+              disabled={permission !== 'granted' || previewSent}
+            >
               <View style={subStyles.rowTextWrap}>
-                <Text style={[subStyles.rowTitle, { color: P.ink }]}>Quiet hours</Text>
-                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>Silence all notifications from 10 PM to 8 AM</Text>
+                <Text style={[subStyles.rowTitle, { color: permission === 'granted' ? A.brand : P.inkDim }]}>
+                  {previewSent ? 'Sending in a moment…' : 'Send me a preview now'}
+                </Text>
+                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>Exactly what tomorrow’s briefing would say, based on today</Text>
               </View>
-              <Switch
-                value={prefs?.quietHours ?? false}
-                onValueChange={(v) => update({ quietHours: v })}
-                disabled={!prefs}
-                trackColor={{ false: P.strokeStrong, true: A.brandSoft }}
-                thumbColor={prefs?.quietHours ? A.brand : P.surface}
-              />
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <View style={subStyles.sectionWrap}>
+          <Text style={[subStyles.aboutSectionLabel, { color: P.inkDim }]}>Reminders</Text>
+          <View style={[subStyles.group, { backgroundColor: P.surface, borderColor: P.stroke }]}>
+            <View style={subStyles.row}>
+              <View style={[subStyles.rowIcon, { backgroundColor: A.brandSoft }]}>
+                <Bell size={18} color={A.brand} strokeWidth={1.75} />
+              </View>
+              <View style={subStyles.rowTextWrap}>
+                <Text style={[subStyles.rowTitle, { color: P.ink }]}>When you tap “Remind”</Text>
+                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>
+                  It rings the morning before the due date at 9 AM, or an hour before a time the message gave. Nothing else is ever sent.
+                </Text>
+              </View>
             </View>
           </View>
         </View>
@@ -424,7 +573,7 @@ function ConnectedToolsPage({
    * button that lies.
    */
   const tools = [
-    { icon: Calendar, label: 'Calendar', subtitle: 'Add travel and appointments to your calendar', connected: false },
+    { icon: Calendar, label: 'Calendar', subtitle: 'Opens your calendar app with the event filled in. No permission needed.', connected: true },
     { icon: CheckSquare, label: 'Tasks', subtitle: 'Push reminders to your task manager', connected: false },
     { icon: Wallet, label: 'Finance', subtitle: 'Reconcile tracked spend against an account', connected: false },
   ];
@@ -464,8 +613,8 @@ function ConnectedToolsPage({
           </View>
         </View>
         <Text style={[subStyles.hint, { color: P.inkDim }]}>
-          None of these are available yet. When they arrive they will run through
-          local platform APIs — nothing is shared with third parties.
+          Calendar works today. Tasks and Finance are planned; when they arrive
+          they will run through local platform APIs — nothing is shared with third parties.
         </Text>
       </ScrollView>
     </>
@@ -509,7 +658,7 @@ function AboutPage({
             <View style={subStyles.row}>
               <View style={subStyles.rowTextWrap}>
                 <Text style={[subStyles.rowTitle, { color: P.ink }]}>On-device intelligence</Text>
-                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>Niva uses a compact ~15MB on-device model to surface actionable insights from your daily signals — all without leaving your phone.</Text>
+                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>Niva uses a compact engine, downloaded once (about 200 MB) and run entirely on your phone, to turn your daily notifications into things you can act on.</Text>
               </View>
             </View>
             <View style={[subStyles.divider, { backgroundColor: P.stroke }]} />
@@ -528,7 +677,7 @@ function AboutPage({
           <View style={[subStyles.group, { backgroundColor: P.surface, borderColor: P.stroke }]}>
             {[
               { Icon: Smartphone, title: '100% on-device processing', text: 'All intelligence runs locally on your phone using a compact on-device model' },
-              { Icon: CloudOff, title: 'Zero telemetry', text: 'No analytics, no tracking, no crash reports — nothing is sent anywhere' },
+              { Icon: CloudOff, title: 'Zero telemetry', text: 'No analytics, no tracking, no crash reports. The engine’s own telemetry is switched off on every request.' },
               { Icon: Lock, title: 'Local storage only', text: 'Signals and insights live in a SQLite database on this device, inside app-private storage' },
               { Icon: Shield, title: 'Network used only to fetch the engine', text: 'The one download is the on-device engine itself. Your messages and insights are never uploaded.' },
             ].map(({ Icon, title, text }, idx, arr) => (
@@ -548,6 +697,25 @@ function AboutPage({
           </View>
         </View>
 
+        <View style={subStyles.sectionWrap}>
+          <View style={[subStyles.group, { backgroundColor: P.surface, borderColor: P.stroke }]}>
+            <TouchableOpacity
+              style={subStyles.row}
+              activeOpacity={0.7}
+              onPress={() => { useOnboardingStore.getState().reset().catch(() => {}); }}
+            >
+              <View style={[subStyles.rowIcon, { backgroundColor: A.brandSoft }]}>
+                <RotateCcw size={18} color={A.brand} strokeWidth={1.75} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={[subStyles.rowTitle, { color: P.ink }]}>Show the introduction again</Text>
+                <Text style={[subStyles.rowSub, { color: P.inkMuted }]}>Walk through permissions and setup from the start</Text>
+              </View>
+              <ChevronRight size={16} color={P.inkDim} />
+            </TouchableOpacity>
+          </View>
+        </View>
+
         <Text style={[subStyles.aboutFooter, { color: P.inkDim }]}>
           Notice · Insight · Value · Action
         </Text>
@@ -563,8 +731,6 @@ export default function MoreScreen() {
   const P = palette(isDark);
   const A = accent(isDark);
   const [subPage, setSubPage] = useState<SubPage>(null);
-  const { consumeReset } = useTabReset();
-
   // Reset sub-page when navigating away from More tab.
   useFocusEffect(
     useCallback(() => {
@@ -575,11 +741,7 @@ export default function MoreScreen() {
   );
 
   // Reset sub-page when re-tapping More in the dock.
-  useEffect(() => {
-    if (consumeReset('more')) {
-      setSubPage(null);
-    }
-  }, [consumeReset]);
+  useTabResetHandler('more', () => setSubPage(null));
 
   const handlePress = (key: string) => {
     setSubPage(key as SubPage);
@@ -764,6 +926,21 @@ const subStyles = StyleSheet.create({
   connectBtn: {
     fontFamily: FONT.semibold,
     fontSize: 13,
+  },
+  chipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  chip: {
+    paddingHorizontal: SPACING.md,
+    paddingVertical: 6,
+    borderRadius: RADIUS.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  chipText: {
+    fontSize: 12,
+    lineHeight: 16,
   },
 
   hint: {

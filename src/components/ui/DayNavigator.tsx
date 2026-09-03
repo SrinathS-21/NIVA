@@ -359,10 +359,10 @@ function WeekDayCell({
       disabled={isFuture}
       onPressIn={() => {
         if (isFuture) return;
-        press.value = withTiming(0.9, { duration: DURATION.press });
+        press.set(withTiming(0.9, { duration: DURATION.press }));
       }}
       onPressOut={() => {
-        press.value = withSpring(1, SPRING);
+        press.set(withSpring(1, SPRING));
       }}
       style={[styles.weekDayCell, isFuture && { opacity: 0.35 }, cellStyle]}
     >

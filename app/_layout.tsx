@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Stack, ThemeProvider, DefaultTheme, DarkTheme } from 'expo-router';
+import { AppState } from 'react-native';
+import { Stack, ThemeProvider, DefaultTheme, DarkTheme, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useFonts } from 'expo-font';
@@ -9,12 +10,15 @@ import { useModelStore } from '../src/store/modelStore';
 import { useThemeStore } from '../src/store/themeStore';
 import { useInboxStore } from '../src/store/inboxStore';
 import { useCaptureStore } from '../src/store/captureStore';
+import { useOnboardingStore } from '../src/store/onboardingStore';
 import {
   onIngestion,
   retryPendingSignals,
   startIngestion,
   stopIngestion,
 } from '../src/core/IngestionService';
+import { initNotifications, onNotificationOpened } from '../src/core/notify/Notifier';
+import { rescheduleDigests } from '../src/core/digest/DigestScheduler';
 import { getDb } from '../src/db/schema';
 import { palette, accent } from '../src/theme/tokens';
 
@@ -34,10 +38,16 @@ SplashScreen.preventAutoHideAsync().catch(() => {
   // Already hidden, or the module is unavailable. Not worth failing a launch over.
 });
 
+// Handler and channels, before any notification can arrive. Idempotent.
+initNotifications();
+
 export default function RootLayout() {
-  const initializeEngine = useModelStore((st) => st.initializeEngine);
+  const ensureEngineStarted = useModelStore((st) => st.ensureEngineStarted);
   const isDark = useThemeStore((st) => st.isDark);
   const loadPersistedMode = useThemeStore((st) => st.loadPersistedMode);
+  const onboarded = useOnboardingStore((st) => st.complete);
+  const loadOnboarding = useOnboardingStore((st) => st.load);
+  const router = useRouter();
   const [dbReady, setDbReady] = useState(false);
 
   // Whichever candidate `ACTIVE_FONT` names in src/theme/fonts.ts — four
@@ -58,16 +68,33 @@ export default function RootLayout() {
   useEffect(() => {
     if (!dbReady) return;
     loadPersistedMode().catch(console.error);
-    initializeEngine().catch(console.error);
-  }, [dbReady, loadPersistedMode, initializeEngine]);
+    loadOnboarding().catch(console.error);
+  }, [dbReady, loadPersistedMode, loadOnboarding]);
+
+  /**
+   * The engine, once the person has been asked.
+   *
+   * It used to start on database-ready, unconditionally — 199 MB over
+   * whatever network happened to be there. Now the onboarding step asks, the
+   * answer is remembered, and this honours it on every launch and every
+   * return to the foreground (a phone that finds Wi-Fi at home should start
+   * the download without being told twice).
+   */
+  useEffect(() => {
+    if (!dbReady || !onboarded) return;
+    ensureEngineStarted().catch(console.error);
+    rescheduleDigests().catch(() => {});
+
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      ensureEngineStarted().catch(console.error);
+      rescheduleDigests().catch(() => {});
+    });
+    return () => sub.remove();
+  }, [dbReady, onboarded, ensureEngineStarted]);
 
   /**
    * Turn capture on.
-   *
-   * This is the wire that was never connected. The whole pipeline —
-   * normalizer, engine, validator, watches — existed and had no caller, which
-   * is why the app shipped reading from `mockData.ts`: with the demo flag off
-   * there was structurally nothing for any screen to show.
    *
    * It starts as soon as the database is open rather than waiting for the
    * engine, deliberately. Signals that arrive during the first-run model
@@ -82,11 +109,13 @@ export default function RootLayout() {
     useCaptureStore.getState().refresh().catch(console.error);
 
     const unsubscribe = onIngestion(({ result }) => {
-      const { addInsight, setLatestOtp } = useInboxStore.getState();
+      const { addInsight, removeInsight, setLatestOtp } = useInboxStore.getState();
 
       if (result.status === 'insight_created' && result.insight) {
         // A watch already handled it — it belongs in Activity, not the inbox.
         if (!result.watchMatch?.action) addInsight(result.insight);
+        // A payment that settled a bill takes the bill's card with it.
+        if (result.reconciledBillId) removeInsight(result.reconciledBillId);
       } else if (result.status === 'otp_extracted' && result.otpCode) {
         setLatestOtp(result.otpCode);
       }
@@ -114,10 +143,28 @@ export default function RootLayout() {
     });
   }, [dbReady]);
 
+  /**
+   * A tapped notification lands where it points.
+   *
+   * The briefing points at the inbox; a reminder at its insight. The module
+   * replays the last response on subscribe, so a cold start from a tap takes
+   * the same path as a warm one.
+   */
+  useEffect(() => {
+    if (!dbReady || !onboarded) return;
+    return onNotificationOpened((url) => {
+      try {
+        router.push(url as never);
+      } catch {
+        router.push('/');
+      }
+    });
+  }, [dbReady, onboarded, router]);
+
   // `fontError` counts as ready on purpose. Holding the splash forever because
   // a face failed to decode turns a cosmetic problem into a launch that looks
   // like a crash; the app falls back to the system face and starts.
-  const ready = (fontsLoaded || !!fontError) && dbReady;
+  const ready = (fontsLoaded || !!fontError) && dbReady && onboarded !== null;
 
   // Hide on layout rather than in an effect, so the splash comes down on the
   // frame the tree has actually been measured and drawn — not one before it,
@@ -171,15 +218,23 @@ export default function RootLayout() {
           contentStyle: { backgroundColor: bg },
         }}
       >
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen
-          name="insight/[id]"
-          options={{
-            headerShown: false,
-            gestureEnabled: true,
-            animation: 'slide_from_right',
-          }}
-        />
+        {/* The introduction, and nothing else, until it has been seen. A
+            route guard rather than a redirect: there is no frame on which
+            the inbox renders and is then replaced. */}
+        <Stack.Protected guard={!onboarded}>
+          <Stack.Screen name="onboarding" options={{ headerShown: false, animation: 'fade' }} />
+        </Stack.Protected>
+        <Stack.Protected guard={!!onboarded}>
+          <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+          <Stack.Screen
+            name="insight/[id]"
+            options={{
+              headerShown: false,
+              gestureEnabled: true,
+              animation: 'slide_from_right',
+            }}
+          />
+        </Stack.Protected>
       </Stack>
     </GestureHandlerRootView>
     </ThemeProvider>

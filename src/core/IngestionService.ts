@@ -13,6 +13,7 @@ import {
   getSmsCaptureEnabled,
 } from '../db/repositories/settings';
 import { processSignal, reprocessStoredSignal, type PipelineResult } from './SignalPipeline';
+import { rescheduleDigestsSoon } from './digest/DigestScheduler';
 
 /**
  * The thing that was missing.
@@ -84,6 +85,10 @@ export function onIngestion(listener: Listener): () => void {
 }
 
 function emit(event: IngestionEvent): void {
+  // A new insight can change what tomorrow's briefing says. Debounced, so a
+  // drain of forty messages rewrites the week once.
+  if (event.result.status === 'insight_created') rescheduleDigestsSoon();
+
   listeners.forEach((fn) => {
     try {
       fn(event);
@@ -224,6 +229,8 @@ export async function injectSignal(input: {
   source?: 'notification' | 'sms';
   sender?: string;
   packageName?: string;
+  /** For the sample messages: a stable time, so running them twice dedupes. */
+  receivedAt?: number;
 }): Promise<PipelineResult> {
   let result: PipelineResult = { status: 'duplicate', reason: 'not_run' };
 
@@ -233,7 +240,7 @@ export async function injectSignal(input: {
       source: input.source ?? 'sms',
       sender: input.sender,
       packageName: input.packageName,
-      receivedAt: Date.now(),
+      receivedAt: input.receivedAt ?? Date.now(),
     });
     if (result.status !== 'duplicate') {
       emit({

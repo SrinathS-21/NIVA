@@ -66,7 +66,9 @@ export function spaceSummary(
 
   switch (key) {
     case 'finance':
-      return `↑ ${rupees(metrics.income)} in · ↓ ${rupees(metrics.expenses)} out`;
+      return metrics.subscriptions
+        ? `↑ ${rupees(metrics.income)} in · ↓ ${rupees(metrics.expenses)} out · ${metrics.subscriptions} subscription${metrics.subscriptions === 1 ? '' : 's'}`
+        : `↑ ${rupees(metrics.income)} in · ↓ ${rupees(metrics.expenses)} out`;
     case 'bill':
       return `${metrics.dueThisWeek ?? 0} due this week · ${metrics.handled} paid`;
     case 'delivery':

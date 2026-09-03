@@ -1,0 +1,22 @@
+{
+  "name": "niva-listing-video",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Play Store listing video and social recap for Niva, rendered with Remotion. Separate from the app on purpose: Remotion is a video renderer for Node + Chromium, not a runtime UI library.",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "render": "remotion render src/index.ts NivaPromo out/niva-promo.mp4",
+    "render:square": "remotion render src/index.ts NivaRecapSquare out/niva-recap.mp4",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "remotion": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "typescript": "^5.6.0"
+  }
+}
